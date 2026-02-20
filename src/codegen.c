@@ -60,7 +60,7 @@ static void emit_jmp(const char *instr, int id) {
 static int label_count = 0;
 static int str_count   = 0;
 
-typedef struct { char name[64]; int offset; int array_size; DataType dtype; } Var;
+typedef struct { char name[64]; int offset; int array_size; char struct_type[64]; DataType dtype; } Var;
 static Var var_table[256];
 static int var_count  = 0;
 static int stack_top  = 0;
@@ -91,6 +91,7 @@ static int add_var(const char *name, DataType dtype) {
     var_table[var_count].offset     = stack_top;
     var_table[var_count].dtype      = dtype;
     var_table[var_count].array_size = 0;
+    var_table[var_count].struct_type[0] = 0;
     strncpy(var_table[var_count].name, name, 63);
     var_count++;
     return stack_top;
@@ -98,14 +99,35 @@ static int add_var(const char *name, DataType dtype) {
 
 // allocate N*8 bytes on stack for array, return offset of element [0]
 static int add_var_array(const char *name, DataType dtype, int size) {
-    int base     = stack_top + 8;   // offset of element [0]
-    stack_top   += size * 8;
+    int base   = stack_top + 8;
+    stack_top += size * 8;
     var_table[var_count].offset     = base;
     var_table[var_count].dtype      = dtype;
     var_table[var_count].array_size = size;
+    var_table[var_count].struct_type[0] = 0;
     strncpy(var_table[var_count].name, name, 63);
     var_count++;
     return base;
+}
+
+// allocate field_count*8 bytes for struct, record struct type name
+static int add_var_struct(const char *name, const char *stype, int field_count) {
+    int base   = stack_top + 8;
+    stack_top += field_count * 8;
+    var_table[var_count].offset     = base;
+    var_table[var_count].dtype      = DTYPE_STRUCT;
+    var_table[var_count].array_size = field_count;
+    strncpy(var_table[var_count].struct_type, stype, 63);
+    strncpy(var_table[var_count].name, name, 63);
+    var_count++;
+    return base;
+}
+
+static const char *var_struct_type(const char *name) {
+    for (int i = 0; i < var_count; i++)
+        if (strcmp(var_table[i].name, name) == 0)
+            return var_table[i].struct_type;
+    return "";
 }
 
 // ─────────────────────────────────────────
@@ -114,9 +136,18 @@ static int add_var_array(const char *name, DataType dtype, int size) {
 static int count_vars(Node *n) {
     if (!n) return 0;
     int count = 0;
-    if (n->type == NODE_ASSIGN)      count = 1;
+    if (n->type == NODE_ASSIGN) {
+        // struct assign takes field_count slots
+        if (n->right && n->right->type == NODE_STRUCT_INIT) {
+            StructDef *sd = find_struct(n->right->name);
+            count = sd ? sd->field_count : 1;
+        } else {
+            count = 1;
+        }
+    }
     if (n->type == NODE_ARRAY_DECL)  count = n->array_size;
-    if (n->type == NODE_ARRAY_INIT)  count = 0;  // already counted by DECL
+    if (n->type == NODE_ARRAY_INIT)  count = 0;
+    if (n->type == NODE_STRUCT_DEF)  count = 0;  // no stack space
     if (n->type == NODE_FOR)         count = 1;
     if (n->left)  count += count_vars(n->left);
     if (n->right) count += count_vars(n->right);
@@ -208,17 +239,40 @@ static void gen_expr(Node *n) {
     // ── array element read: nums[i] ──
     // address of nums[i] = rbp - (base + i*8)
     case NODE_ARRAY_ACCESS: {
-        int base = var_offset(n->name);   // offset of element [0]
-        gen_expr(n->left);                // index → rax
-        emitln("imul rax, 8");            // i * 8
-        emitln("neg rax");                // -(i*8)
-        emit("add rax, ");                // rax = -(i*8) + (-base) = -(base+i*8)
+        int base = var_offset(n->name);
+        gen_expr(n->left);
+        emitln("imul rax, 8");
+        emitln("neg rax");
+        emit("add rax, ");
         buf_write_str(out_buf, &out_cursor, "qword -");
         buf_write_int(out_buf, &out_cursor, base);
         buf_write_str(out_buf, &out_cursor, "\n");
-        emitln("add rax, rbp");           // rax = rbp - (base + i*8)
-        emitln("mov rax, [rax]");         // load element value
+        emitln("add rax, rbp");
+        emitln("mov rax, [rax]");
         n->dtype = var_dtype(n->name);
+        break;
+    }
+
+    // ── struct field read: p.field ──
+    // field address = rbp - (var_base + field_offset)
+    case NODE_FIELD_ACCESS: {
+        int base          = var_offset(n->name);
+        const char *stype = var_struct_type(n->name);
+        StructDef  *sd    = find_struct(stype);
+        if (!sd) {
+            fprintf(stderr, "Codegen error: '%s' is not a struct\n", n->name);
+            exit(1);
+        }
+        int foff = 0;
+        DataType ftype = DTYPE_INT;
+        if (!find_field(sd, n->sval, &foff, &ftype)) {
+            fprintf(stderr, "Codegen error: struct '%s' has no field '%s'\n", stype, n->sval);
+            exit(1);
+        }
+        emit("mov rax, [rbp-");
+        buf_write_int(out_buf, &out_cursor, base + foff);
+        buf_write_str(out_buf, &out_cursor, "]\n");
+        n->dtype = ftype;
         break;
     }
 
@@ -314,20 +368,37 @@ static void gen_stmt(Node *n) {
         break;
     }
 
-    // ── variable assignment ──
-    // KEY FIX: if var is float but right side is int literal,
-    // use cvtsi2sd to convert properly (not movq which reinterprets bits)
+    // ── struct definition — no code emitted, already registered in parser ──
+    case NODE_STRUCT_DEF:
+        break;
+
+    // ── struct initialisation: let p = Point(10, 20) ──
+    // allocates field_count slots, stores each arg into successive fields
     case NODE_ASSIGN: {
+        if (n->right && n->right->type == NODE_STRUCT_INIT) {
+            StructDef *sd = find_struct(n->right->name);
+            if (!sd) {
+                fprintf(stderr, "Codegen error: unknown struct '%s'\n", n->right->name);
+                exit(1);
+            }
+            int base = add_var_struct(n->name, n->right->name, sd->field_count);
+            for (int i = 0; i < n->right->child_count && i < sd->field_count; i++) {
+                gen_expr(n->right->children[i]);
+                emit("mov [rbp-");
+                buf_write_int(out_buf, &out_cursor, base + sd->fields[i].offset);
+                buf_write_str(out_buf, &out_cursor, "], rax\n");
+            }
+            break;
+        }
+        // regular variable assignment (int / float / bool / str)
         int off = add_var(n->name, n->dtype);
         if (n->dtype == DTYPE_FLOAT) {
             if (n->right->type == NODE_NUMBER) {
-                // int literal → float: load int into rax, convert to double in xmm0
                 emit("mov rax, ");
                 buf_write_int(out_buf, &out_cursor, n->right->ival);
                 buf_write_str(out_buf, &out_cursor, "\n");
-                emitln("cvtsi2sd xmm0, rax");     // convert int → double properly
+                emitln("cvtsi2sd xmm0, rax");
             } else {
-                // already a float expression: bits are in rax, move to xmm0
                 gen_expr(n->right);
                 emitln("movq xmm0, rax");
             }
@@ -336,7 +407,6 @@ static void gen_stmt(Node *n) {
             buf_write_str(out_buf, &out_cursor, "], xmm0\n");
         } else if (n->dtype == DTYPE_BOOL) {
             gen_expr(n->right);
-            // bool is 1 byte — only store al (low byte of rax)
             emit("mov byte [rbp-");
             buf_write_int(out_buf, &out_cursor, off);
             buf_write_str(out_buf, &out_cursor, "], al\n");
@@ -349,7 +419,27 @@ static void gen_stmt(Node *n) {
         break;
     }
 
-    // ── variable reassignment ──
+    // ── field assignment: p.field = val ──
+    case NODE_FIELD_ASSIGN: {
+        int base          = var_offset(n->name);
+        const char *stype = var_struct_type(n->name);
+        StructDef  *sd    = find_struct(stype);
+        if (!sd) {
+            fprintf(stderr, "Codegen error: '%s' is not a struct\n", n->name);
+            exit(1);
+        }
+        int foff = 0;
+        DataType ftype = DTYPE_INT;
+        if (!find_field(sd, n->sval, &foff, &ftype)) {
+            fprintf(stderr, "Codegen error: struct '%s' has no field '%s'\n", stype, n->sval);
+            exit(1);
+        }
+        gen_expr(n->right);
+        emit("mov [rbp-");
+        buf_write_int(out_buf, &out_cursor, base + foff);
+        buf_write_str(out_buf, &out_cursor, "], rax\n");
+        break;
+    }
     case NODE_REASSIGN: {
         gen_expr(n->right);
         int off      = var_offset(n->name);

@@ -6,6 +6,30 @@
 static int cursor = 0;
 
 // ─────────────────────────────────────────
+// Struct registry (shared with codegen)
+// ─────────────────────────────────────────
+StructDef struct_defs[MAX_STRUCTS];
+int       struct_def_count = 0;
+
+StructDef *find_struct(const char *name) {
+    for (int i = 0; i < struct_def_count; i++)
+        if (strcmp(struct_defs[i].name, name) == 0)
+            return &struct_defs[i];
+    return NULL;
+}
+
+int find_field(StructDef *sd, const char *field, int *out_offset, DataType *out_dtype) {
+    for (int i = 0; i < sd->field_count; i++) {
+        if (strcmp(sd->fields[i].name, field) == 0) {
+            if (out_offset) *out_offset = sd->fields[i].offset;
+            if (out_dtype)  *out_dtype  = sd->fields[i].dtype;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// ─────────────────────────────────────────
 // Node allocator
 // ─────────────────────────────────────────
 static Node node_pool[MAX_NODES];
@@ -25,7 +49,8 @@ Node *new_node(NodeType type) {
 // ─────────────────────────────────────────
 // Token helpers
 // ─────────────────────────────────────────
-static Token *peek() { return &tokens[cursor]; }
+static Token *peek()  { return &tokens[cursor]; }
+static Token *peek2() { return &tokens[cursor + 1]; }  // one ahead
 
 static Token *advance() {
     Token *t = &tokens[cursor];
@@ -53,8 +78,7 @@ static Node *parse_block_body();
 static Node *parse_block();
 
 // ─────────────────────────────────────────
-// Parse type keyword after ':' or '->'
-// caller has already consumed the colon/arrow
+// Parse type keyword (after colon/arrow consumed)
 // ─────────────────────────────────────────
 static DataType parse_type_keyword() {
     Token *t = peek();
@@ -63,16 +87,18 @@ static DataType parse_type_keyword() {
     if (t->type == TOK_TSTR)   { advance(); return DTYPE_STR;   }
     if (t->type == TOK_TPTR)   { advance(); return DTYPE_PTR;   }
     if (t->type == TOK_TBOOL)  { advance(); return DTYPE_BOOL;  }
-    fprintf(stderr, "Parse error: expected type (int/float/str/ptr/bool), got '%s'\n", t->value);
+    // struct type — ident that matches a registered struct
+    if (t->type == TOK_IDENT && find_struct(t->value)) {
+        advance();
+        return DTYPE_STRUCT;
+    }
+    fprintf(stderr, "Parse error: expected type, got '%s'\n", t->value);
     exit(1);
 }
 
-// ─────────────────────────────────────────
-// Parse optional ': type' annotation
-// ─────────────────────────────────────────
 static DataType parse_type_annotation() {
     if (peek()->type != TOK_COLON) return DTYPE_UNKNOWN;
-    advance();  // consume ':'
+    advance();
     return parse_type_keyword();
 }
 
@@ -81,27 +107,23 @@ static DataType parse_type_annotation() {
 // ─────────────────────────────────────────
 static DataType infer_type(Node *expr) {
     if (!expr) return DTYPE_UNKNOWN;
-    if (expr->type == NODE_NUMBER) return DTYPE_INT;
-    if (expr->type == NODE_STRING) return DTYPE_STR;
-    if (expr->dtype != DTYPE_UNKNOWN) return expr->dtype;
+    if (expr->type == NODE_NUMBER)      return DTYPE_INT;
+    if (expr->type == NODE_STRING)      return DTYPE_STR;
+    if (expr->type == NODE_BOOL)        return DTYPE_BOOL;
+    if (expr->type == NODE_STRUCT_INIT) return DTYPE_STRUCT;
+    if (expr->dtype != DTYPE_UNKNOWN)   return expr->dtype;
     return DTYPE_INT;
 }
 
 // ─────────────────────────────────────────
-// Compile-time expression evaluator
-// Walks AST and reduces to a single integer
-// Supports: +  -  *  /  and named comptime vars
+// Compile-time evaluator
 // ─────────────────────────────────────────
-
-// table of comptime variables (let x: int = comptime(...))
 static struct { char name[64]; long value; } ct_vars[256];
 static int ct_var_count = 0;
 
 static void ct_set(const char *name, long val) {
-    // update if exists
     for (int i = 0; i < ct_var_count; i++)
         if (strcmp(ct_vars[i].name, name) == 0) { ct_vars[i].value = val; return; }
-    // add new
     strncpy(ct_vars[ct_var_count].name, name, 63);
     ct_vars[ct_var_count].value = val;
     ct_var_count++;
@@ -133,12 +155,14 @@ static long eval_comptime(Node *n) {
             exit(1);
         }
         default:
-            fprintf(stderr, "comptime error: unsupported node type %d\n", n->type);
+            fprintf(stderr, "comptime error: cannot evaluate node type %d at compile time\n", n->type);
             exit(1);
     }
 }
 
-
+// ─────────────────────────────────────────
+// Parse block body — stops at elif/else/end
+// ─────────────────────────────────────────
 static Node *parse_block_body() {
     Node *block = new_node(NODE_BLOCK);
     while (peek()->type != TOK_END  &&
@@ -168,15 +192,55 @@ static Node *parse_block() {
 static Node *parse_statement() {
     Token *t = peek();
 
+    // ── struct Name ... end ──
+    if (t->type == TOK_STRUCT) {
+        advance();
+        Token *name = expect(TOK_IDENT, "struct name");
+
+        // register struct definition
+        StructDef *sd = &struct_defs[struct_def_count++];
+        memset(sd, 0, sizeof(StructDef));
+        strncpy(sd->name, name->value, 63);
+
+        Node *n = new_node(NODE_STRUCT_DEF);
+        strncpy(n->name, name->value, 63);
+
+        // parse fields: name: type
+        int offset = 0;
+        while (peek()->type != TOK_END && peek()->type != TOK_EOF) {
+            Token *fname = expect(TOK_IDENT, "field name");
+            expect(TOK_COLON, ":");
+            DataType ftype = parse_type_keyword();
+
+            // register field in struct def
+            FieldDef *fd = &sd->fields[sd->field_count];
+            strncpy(fd->name, fname->value, 63);
+            fd->dtype  = ftype;
+            fd->offset = offset;
+            sd->field_count++;
+            offset += 8;
+
+            // also as child node for codegen
+            Node *field = new_node(NODE_IDENT);
+            strncpy(field->name, fname->value, 63);
+            field->dtype = ftype;
+            field->ival  = offset - 8;   // store offset in ival
+            n->children[n->child_count++] = field;
+        }
+        sd->total_size = offset;
+        expect(TOK_END, "end");
+        return n;
+    }
+
     // ── let x: type = expr  /  let x = expr  /  let nums: int[5] ──
     if (t->type == TOK_LET) {
         advance();
         Token *name       = expect(TOK_IDENT, "variable name");
-        DataType declared = parse_type_annotation();   // optional ': type'
+        DataType declared = parse_type_annotation();
 
-        // ── array declaration: let nums: int[5]  OR  let nums: int[4] = {1,2,3,4} ──
+        // ── array declaration: let nums: int[5] = {1,2,3} ──
         if (peek()->type == TOK_LBRACKET) {
-            advance();  // consume '['
+            advance();
             Token *sz  = expect(TOK_NUMBER, "array size");
             int    asz = atoi(sz->value);
             expect(TOK_RBRACKET, "]");
@@ -186,9 +250,8 @@ static Node *parse_statement() {
             n->dtype      = (declared != DTYPE_UNKNOWN) ? declared : DTYPE_INT;
             n->array_size = asz;
 
-            // optional initialiser: = {1, 2, 3, 4}
             if (peek()->type == TOK_EQ) {
-                advance();  // consume '='
+                advance();
                 expect(TOK_LBRACE, "{");
                 Node *init       = new_node(NODE_ARRAY_INIT);
                 strncpy(init->name, name->value, 63);
@@ -199,8 +262,6 @@ static Node *parse_statement() {
                     if (peek()->type == TOK_COMMA) advance();
                 }
                 expect(TOK_RBRACE, "}");
-                // return both nodes wrapped: decl first, then init
-                // we use a block node to carry both
                 Node *blk = new_node(NODE_BLOCK);
                 blk->children[blk->child_count++] = n;
                 blk->children[blk->child_count++] = init;
@@ -216,9 +277,11 @@ static Node *parse_statement() {
         n->right = parse_comparison();
 
         DataType inferred = infer_type(n->right);
+
         if (declared != DTYPE_UNKNOWN) {
-            int coerce_ok = (declared == DTYPE_FLOAT && inferred == DTYPE_INT) ||
-                            (declared == DTYPE_BOOL  && inferred == DTYPE_INT);
+            int coerce_ok = (declared == DTYPE_FLOAT  && inferred == DTYPE_INT) ||
+                            (declared == DTYPE_BOOL   && inferred == DTYPE_INT) ||
+                            (declared == DTYPE_STRUCT && inferred == DTYPE_STRUCT);
             if (!coerce_ok && inferred != DTYPE_UNKNOWN && declared != inferred) {
                 fprintf(stderr, "Type error: '%s' declared as type %d but value is type %d\n",
                         name->value, declared, inferred);
@@ -228,10 +291,14 @@ static Node *parse_statement() {
         } else {
             n->dtype = (inferred != DTYPE_UNKNOWN) ? inferred : DTYPE_INT;
         }
+
+        // for struct assignments, carry the struct type name in sval
+        if (n->right->type == NODE_STRUCT_INIT)
+            strncpy(n->sval, n->right->name, 63);
+
         n->right->dtype = n->dtype;
 
-        // if right side was a comptime (now folded to NODE_NUMBER),
-        // register this variable so other comptime exprs can use it
+        // register comptime variable for cross-reference
         if (n->right->type == NODE_NUMBER)
             ct_set(n->name, (long)n->right->ival);
 
@@ -251,7 +318,7 @@ static Node *parse_statement() {
         advance();
         expect(TOK_LPAREN, "(");
         Node *n  = new_node(NODE_PRINT);
-        n->right = parse_expression();
+        n->right = parse_comparison();
         expect(TOK_RPAREN, ")");
         return n;
     }
@@ -262,7 +329,6 @@ static Node *parse_statement() {
         Node *n  = new_node(NODE_IF);
         n->left  = parse_comparison();
         n->right = parse_block_body();
-
         while (peek()->type == TOK_ELIF) {
             advance();
             Node *elif_node  = new_node(NODE_ELIF);
@@ -280,7 +346,7 @@ static Node *parse_statement() {
         return n;
     }
 
-    // ── while condition ... end ──
+    // ── while ──
     if (t->type == TOK_WHILE) {
         advance();
         Node *n  = new_node(NODE_WHILE);
@@ -292,14 +358,14 @@ static Node *parse_statement() {
     // ── for i = start to limit [step n] ... end ──
     if (t->type == TOK_FOR) {
         advance();
-        Node *n  = new_node(NODE_FOR);
+        Node *n    = new_node(NODE_FOR);
         Token *var = expect(TOK_IDENT, "loop variable");
         strncpy(n->name, var->value, 63);
         n->dtype = DTYPE_INT;
         expect(TOK_EQ, "=");
-        n->children[0] = parse_expression();    // start
+        n->children[0] = parse_expression();
         expect(TOK_TO, "to");
-        n->children[1] = parse_expression();    // limit
+        n->children[1] = parse_expression();
         if (peek()->type == TOK_STEP) {
             advance();
             n->children[2] = parse_expression();
@@ -316,28 +382,20 @@ static Node *parse_statement() {
     }
 
     // ── match x ... end ──
-    // cases: literal -> stmt  OR  else -> stmt
-    // NODE_MATCH.left = subject expression
-    // NODE_MATCH.children[] = NODE_MATCH_CASE nodes
-    //   NODE_MATCH_CASE.left  = value expr (NULL for else)
-    //   NODE_MATCH_CASE.right = body statement
     if (t->type == TOK_MATCH) {
         advance();
-        Node *n  = new_node(NODE_MATCH);
-        n->left  = parse_expression();   // subject: match x
-
+        Node *n = new_node(NODE_MATCH);
+        n->left = parse_expression();
         while (peek()->type != TOK_END && peek()->type != TOK_EOF) {
             Node *c = new_node(NODE_MATCH_CASE);
-
             if (peek()->type == TOK_ELSE) {
-                advance();               // consume 'else'
-                c->left = NULL;          // NULL = else branch
+                advance();
+                c->left = NULL;
             } else {
-                c->left = parse_expression();  // case value
+                c->left = parse_expression();
             }
-
-            expect(TOK_ARROW, "->");     // consume '->'
-            c->right = parse_statement();// case body (single statement)
+            expect(TOK_ARROW, "->");
+            c->right = parse_statement();
             n->children[n->child_count++] = c;
         }
         expect(TOK_END, "end");
@@ -350,36 +408,35 @@ static Node *parse_statement() {
         Token *name = expect(TOK_IDENT, "function name");
         Node *n = new_node(NODE_FN_DEF);
         strncpy(n->name, name->value, 63);
-        n->dtype = DTYPE_INT;   // default return type
+        n->dtype = DTYPE_INT;
 
         expect(TOK_LPAREN, "(");
         while (peek()->type != TOK_RPAREN) {
             Token *param = expect(TOK_IDENT, "parameter name");
             Node *p  = new_node(NODE_IDENT);
             strncpy(p->name, param->value, 63);
-            p->dtype = parse_type_annotation();   // optional ': type'
+            p->dtype = parse_type_annotation();
             if (p->dtype == DTYPE_UNKNOWN) p->dtype = DTYPE_INT;
             n->children[n->child_count++] = p;
             if (peek()->type == TOK_COMMA) advance();
         }
         expect(TOK_RPAREN, ")");
 
-        // optional '-> returntype'
         if (peek()->type == TOK_ARROW) {
-            advance();                  // consume '->'
-            n->dtype = parse_type_keyword();   // read type directly (no colon)
+            advance();
+            n->dtype = parse_type_keyword();
         }
-
         n->right = parse_block();
         return n;
     }
 
-    // ── ident(...) / ident[i] = expr / ident = expr ──
+    // ── ident-based statements ──
     if (t->type == TOK_IDENT) {
         char name[64];
         strncpy(name, t->value, 63);
         advance();
 
+        // function call statement
         if (peek()->type == TOK_LPAREN) {
             advance();
             Node *n = new_node(NODE_FN_CALL);
@@ -392,18 +449,31 @@ static Node *parse_statement() {
             return n;
         }
 
-        // ── array element assignment: nums[i] = val ──
+        // array element assignment: nums[i] = val
         if (peek()->type == TOK_LBRACKET) {
-            advance();  // consume '['
+            advance();
             Node *n = new_node(NODE_ARRAY_ASSIGN);
             strncpy(n->name, name, 63);
-            n->left  = parse_expression();   // index
+            n->left  = parse_expression();
             expect(TOK_RBRACKET, "]");
             expect(TOK_EQ, "=");
-            n->right = parse_expression();   // value
+            n->right = parse_expression();
             return n;
         }
 
+        // field assignment: p.field = val
+        if (peek()->type == TOK_DOT) {
+            advance();  // consume '.'
+            Token *field = expect(TOK_IDENT, "field name");
+            expect(TOK_EQ, "=");
+            Node *n = new_node(NODE_FIELD_ASSIGN);
+            strncpy(n->name,  name,          63);   // struct var name
+            strncpy(n->sval,  field->value,  63);   // field name
+            n->right = parse_expression();
+            return n;
+        }
+
+        // plain reassignment: x = val
         if (peek()->type == TOK_EQ) {
             advance();
             Node *n  = new_node(NODE_REASSIGN);
@@ -421,7 +491,7 @@ static Node *parse_statement() {
 }
 
 // ─────────────────────────────────────────
-// Comparison: expr (> < == != >= <=) expr
+// Comparison
 // ─────────────────────────────────────────
 static Node *parse_comparison() {
     Node *left = parse_expression();
@@ -472,19 +542,19 @@ static Node *parse_term() {
 }
 
 // ─────────────────────────────────────────
-// Factor: number | string | ident | fn_call | (expr)
+// Factor: number | string | bool | comptime | ident | fn_call | array_access | field_access | (expr)
 // ─────────────────────────────────────────
 static Node *parse_factor() {
     Token *t = peek();
 
-    // ── comptime(expr) — evaluate at compile time, inline as constant ──
+    // comptime(expr)
     if (t->type == TOK_COMPTIME) {
         advance();
         expect(TOK_LPAREN, "(");
         Node *inner = parse_expression();
         expect(TOK_RPAREN, ")");
-        long val = eval_comptime(inner);   // evaluate NOW in compiler
-        Node *n  = new_node(NODE_NUMBER);  // replace with constant
+        long val = eval_comptime(inner);
+        Node *n  = new_node(NODE_NUMBER);
         n->ival  = (int)val;
         n->dtype = DTYPE_INT;
         return n;
@@ -498,7 +568,6 @@ static Node *parse_factor() {
         return n;
     }
 
-    // ── bool literals ──
     if (t->type == TOK_TRUE || t->type == TOK_FALSE) {
         advance();
         Node *n  = new_node(NODE_BOOL);
@@ -520,11 +589,26 @@ static Node *parse_factor() {
         strncpy(name, t->value, 63);
         advance();
 
+        // function call or struct constructor: Name(...)
         if (peek()->type == TOK_LPAREN) {
             advance();
+            // is this a struct constructor?
+            StructDef *sd = find_struct(name);
+            if (sd) {
+                Node *n = new_node(NODE_STRUCT_INIT);
+                strncpy(n->name, name, 63);   // struct type name
+                n->dtype = DTYPE_STRUCT;
+                while (peek()->type != TOK_RPAREN && peek()->type != TOK_EOF) {
+                    n->children[n->child_count++] = parse_expression();
+                    if (peek()->type == TOK_COMMA) advance();
+                }
+                expect(TOK_RPAREN, ")");
+                return n;
+            }
+            // regular function call
             Node *n = new_node(NODE_FN_CALL);
             strncpy(n->name, name, 63);
-            while (peek()->type != TOK_RPAREN) {
+            while (peek()->type != TOK_RPAREN && peek()->type != TOK_EOF) {
                 n->children[n->child_count++] = parse_expression();
                 if (peek()->type == TOK_COMMA) advance();
             }
@@ -532,16 +616,27 @@ static Node *parse_factor() {
             return n;
         }
 
-        // ── array element read: nums[i] in expression ──
+        // array access: nums[i]
         if (peek()->type == TOK_LBRACKET) {
-            advance();  // consume '['
+            advance();
             Node *n = new_node(NODE_ARRAY_ACCESS);
             strncpy(n->name, name, 63);
-            n->left = parse_expression();   // index
+            n->left = parse_expression();
             expect(TOK_RBRACKET, "]");
             return n;
         }
 
+        // field access: p.field
+        if (peek()->type == TOK_DOT) {
+            advance();  // consume '.'
+            Token *field = expect(TOK_IDENT, "field name");
+            Node *n = new_node(NODE_FIELD_ACCESS);
+            strncpy(n->name, name,         63);  // struct var name
+            strncpy(n->sval, field->value, 63);  // field name
+            return n;
+        }
+
+        // plain identifier
         Node *n = new_node(NODE_IDENT);
         strncpy(n->name, name, 63);
         return n;
