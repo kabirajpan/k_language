@@ -60,7 +60,7 @@ static void emit_jmp(const char *instr, int id) {
 static int label_count = 0;
 static int str_count   = 0;
 
-typedef struct { char name[64]; int offset; DataType dtype; } Var;
+typedef struct { char name[64]; int offset; int array_size; DataType dtype; } Var;
 static Var var_table[256];
 static int var_count  = 0;
 static int stack_top  = 0;
@@ -88,11 +88,24 @@ static DataType var_dtype(const char *name) {
 
 static int add_var(const char *name, DataType dtype) {
     stack_top += 8;
-    var_table[var_count].offset = stack_top;
-    var_table[var_count].dtype  = dtype;
+    var_table[var_count].offset     = stack_top;
+    var_table[var_count].dtype      = dtype;
+    var_table[var_count].array_size = 0;
     strncpy(var_table[var_count].name, name, 63);
     var_count++;
     return stack_top;
+}
+
+// allocate N*8 bytes on stack for array, return offset of element [0]
+static int add_var_array(const char *name, DataType dtype, int size) {
+    int base     = stack_top + 8;   // offset of element [0]
+    stack_top   += size * 8;
+    var_table[var_count].offset     = base;
+    var_table[var_count].dtype      = dtype;
+    var_table[var_count].array_size = size;
+    strncpy(var_table[var_count].name, name, 63);
+    var_count++;
+    return base;
 }
 
 // ─────────────────────────────────────────
@@ -101,8 +114,10 @@ static int add_var(const char *name, DataType dtype) {
 static int count_vars(Node *n) {
     if (!n) return 0;
     int count = 0;
-    if (n->type == NODE_ASSIGN) count = 1;
-    if (n->type == NODE_FOR)    count = 1;
+    if (n->type == NODE_ASSIGN)      count = 1;
+    if (n->type == NODE_ARRAY_DECL)  count = n->array_size;
+    if (n->type == NODE_ARRAY_INIT)  count = 0;  // already counted by DECL
+    if (n->type == NODE_FOR)         count = 1;
     if (n->left)  count += count_vars(n->left);
     if (n->right) count += count_vars(n->right);
     for (int i = 0; i < n->child_count; i++)
@@ -190,6 +205,23 @@ static void gen_expr(Node *n) {
         break;
     }
 
+    // ── array element read: nums[i] ──
+    // address of nums[i] = rbp - (base + i*8)
+    case NODE_ARRAY_ACCESS: {
+        int base = var_offset(n->name);   // offset of element [0]
+        gen_expr(n->left);                // index → rax
+        emitln("imul rax, 8");            // i * 8
+        emitln("neg rax");                // -(i*8)
+        emit("add rax, ");                // rax = -(i*8) + (-base) = -(base+i*8)
+        buf_write_str(out_buf, &out_cursor, "qword -");
+        buf_write_int(out_buf, &out_cursor, base);
+        buf_write_str(out_buf, &out_cursor, "\n");
+        emitln("add rax, rbp");           // rax = rbp - (base + i*8)
+        emitln("mov rax, [rax]");         // load element value
+        n->dtype = var_dtype(n->name);
+        break;
+    }
+
     // ── binary operation ──
     // FIX: use r10 for simple right-hand sides to avoid push/pop
     // fall back to push/pop for nested expressions to avoid r10 clobbering
@@ -243,6 +275,44 @@ static void gen_stmt(Node *n) {
     case NODE_BLOCK:
         for (int i = 0; i < n->child_count; i++) gen_stmt(n->children[i]);
         break;
+
+    // ── array declaration: let nums: int[5] ──
+    // reserves N*8 bytes on stack, no initialisation
+    case NODE_ARRAY_DECL:
+        add_var_array(n->name, n->dtype, n->array_size);
+        break;
+
+    // ── array inline initialiser: {1, 2, 3, 4} ──
+    // array must already be declared (NODE_ARRAY_DECL emitted first via block)
+    // emits a store for each element value
+    case NODE_ARRAY_INIT: {
+        int base = var_offset(n->name);
+        for (int i = 0; i < n->child_count; i++) {
+            gen_expr(n->children[i]);           // value → rax
+            emit("mov qword [rbp-");
+            buf_write_int(out_buf, &out_cursor, base + i * 8);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+        }
+        break;
+    }
+
+    // ── array element write: nums[i] = val ──
+    // address = rbp - (base + i*8)
+    case NODE_ARRAY_ASSIGN: {
+        int base = var_offset(n->name);
+        gen_expr(n->right);               // value → rax
+        emitln("push rax");               // save value
+        gen_expr(n->left);                // index → rax
+        emitln("imul rax, 8");            // i * 8
+        emitln("neg rax");                // -(i*8)
+        emit("add rax, qword -");
+        buf_write_int(out_buf, &out_cursor, base);
+        buf_write_str(out_buf, &out_cursor, "\n");
+        emitln("add rax, rbp");           // rax = address of nums[i]
+        emitln("pop rbx");                // restore value into rbx
+        emitln("mov [rax], rbx");         // store value
+        break;
+    }
 
     // ── variable assignment ──
     // KEY FIX: if var is float but right side is int literal,
@@ -494,6 +564,49 @@ static void gen_stmt(Node *n) {
     case NODE_FN_CALL:
         gen_expr(n);
         break;
+
+    // ── match x ... end ──
+    // emits compare chain: eval subject, cmp each case, jump to matching body
+    // else branch is fallthrough default
+    case NODE_MATCH: {
+        int lbl_end = new_label();
+
+        // allocate a label for each case body
+        int case_labels[64];
+        int else_label = -1;
+        for (int i = 0; i < n->child_count; i++) {
+            case_labels[i] = new_label();
+            if (n->children[i]->left == NULL)
+                else_label = case_labels[i];
+        }
+
+        // emit compare chain — eval subject once into r13, compare each case
+        gen_expr(n->left);
+        emitln("mov r13, rax");      // subject stays in r13
+
+        for (int i = 0; i < n->child_count; i++) {
+            Node *c = n->children[i];
+            if (c->left == NULL) continue;   // skip else here, handle at bottom
+            gen_expr(c->left);               // case value → rax
+            emitln("cmp r13, rax");
+            emit_jmp("je", case_labels[i]);
+        }
+
+        // no case matched — jump to else if exists, else to end
+        if (else_label >= 0) emit_jmp("jmp", else_label);
+        else                  emit_jmp("jmp", lbl_end);
+
+        // emit each case body
+        for (int i = 0; i < n->child_count; i++) {
+            Node *c = n->children[i];
+            emit_label(case_labels[i]);
+            gen_stmt(c->right);         // case body
+            emit_jmp("jmp", lbl_end);
+        }
+
+        emit_label(lbl_end);
+        break;
+    }
 
     default:
         fprintf(stderr, "Codegen error: unknown statement node\n");

@@ -25,6 +25,9 @@ typedef enum {
     TOK_PRINT,
     TOK_TRUE,      // true
     TOK_FALSE,     // false
+    TOK_MATCH,     // match
+    TOK_COMPTIME,  // comptime
+    TOK_ARROW_FAT, // -> (match case arrow, different from fn return ->)
 
     // operators
     TOK_PLUS,
@@ -43,8 +46,12 @@ typedef enum {
     TOK_LPAREN,
     TOK_RPAREN,
     TOK_COMMA,
-    TOK_COLON,     // :
-    TOK_ARROW,     // ->
+    TOK_COLON,      // :
+    TOK_ARROW,      // ->
+    TOK_LBRACKET,   // [
+    TOK_RBRACKET,   // ]
+    TOK_LBRACE,     // {
+    TOK_RBRACE,     // }
 
     // type keywords
     TOK_TINT,      // int
@@ -82,7 +89,10 @@ typedef enum {
     NODE_IDENT,
     NODE_STRING,
     NODE_BINOP,
-    NODE_ASSIGN,    // let x = expr
+    NODE_ASSIGN,        // let x = expr
+    NODE_ARRAY_DECL,    // let nums: int[5]
+    NODE_ARRAY_ASSIGN,  // nums[i] = expr
+    NODE_ARRAY_ACCESS,  // nums[i] in expression
     NODE_REASSIGN,  // x = expr  (no let)
     NODE_PRINT,
     NODE_IF,        // if / elif chain + optional else
@@ -94,6 +104,10 @@ typedef enum {
     NODE_BLOCK,
     NODE_ELIF,      // single elif branch (cond + body)
     NODE_ELSE,      // else body
+    NODE_MATCH,          // match x ... end
+    NODE_MATCH_CASE,     // single case: value -> stmt
+    NODE_ARRAY_INIT,     // {1, 2, 3} inline initialiser
+    NODE_COMPTIME,       // comptime(expr) — evaluated at compile time
 } NodeType;
 
 // forward declare
@@ -104,6 +118,7 @@ struct Node {
 
     char     name[64];      // ident name, fn name, param name
     int      ival;          // number value / bool value (0 or 1)
+    int      array_size;    // >0 for array declarations: int[5] → 5
     char     op[3];         // operator: +  -  *  /  >  <  =  !=  >=  <=
     char     sval[256];     // string literal value
     DataType dtype;         // resolved data type

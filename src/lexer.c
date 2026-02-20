@@ -38,6 +38,8 @@ static int is_keyword(const char *s, TokenType *out) {
     if (strcmp(s, "bool")   == 0) { *out = TOK_TBOOL;  return 1; }
     if (strcmp(s, "true")   == 0) { *out = TOK_TRUE;   return 1; }
     if (strcmp(s, "false")  == 0) { *out = TOK_FALSE;  return 1; }
+    if (strcmp(s, "match")    == 0) { *out = TOK_MATCH;    return 1; }
+    if (strcmp(s, "comptime") == 0) { *out = TOK_COMPTIME; return 1; }
     return 0;
 }
 
@@ -122,8 +124,12 @@ void tokenize(const char *src) {
             case '<': add_token(TOK_LT,     "<");  break;
             case '(': add_token(TOK_LPAREN, "(");  break;
             case ')': add_token(TOK_RPAREN, ")");  break;
-            case ',': add_token(TOK_COMMA,  ",");  break;
-            case ':': add_token(TOK_COLON,  ":");  break;
+            case ',': add_token(TOK_COMMA,    ",");  break;
+            case ':': add_token(TOK_COLON,    ":");  break;
+            case '[': add_token(TOK_LBRACKET, "[");  break;
+            case ']': add_token(TOK_RBRACKET, "]");  break;
+            case '{': add_token(TOK_LBRACE,   "{");  break;
+            case '}': add_token(TOK_RBRACE,   "}");  break;
             default:
                 fprintf(stderr, "Lexer error: unknown character '%c'\n", c);
                 exit(1);

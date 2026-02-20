@@ -88,9 +88,57 @@ static DataType infer_type(Node *expr) {
 }
 
 // ─────────────────────────────────────────
-// Parse block body: statements until end/elif/else
-// does NOT consume the terminator
+// Compile-time expression evaluator
+// Walks AST and reduces to a single integer
+// Supports: +  -  *  /  and named comptime vars
 // ─────────────────────────────────────────
+
+// table of comptime variables (let x: int = comptime(...))
+static struct { char name[64]; long value; } ct_vars[256];
+static int ct_var_count = 0;
+
+static void ct_set(const char *name, long val) {
+    // update if exists
+    for (int i = 0; i < ct_var_count; i++)
+        if (strcmp(ct_vars[i].name, name) == 0) { ct_vars[i].value = val; return; }
+    // add new
+    strncpy(ct_vars[ct_var_count].name, name, 63);
+    ct_vars[ct_var_count].value = val;
+    ct_var_count++;
+}
+
+static long ct_get(const char *name) {
+    for (int i = 0; i < ct_var_count; i++)
+        if (strcmp(ct_vars[i].name, name) == 0) return ct_vars[i].value;
+    fprintf(stderr, "comptime error: unknown variable '%s'\n", name);
+    exit(1);
+}
+
+static long eval_comptime(Node *n) {
+    if (!n) { fprintf(stderr, "comptime error: null node\n"); exit(1); }
+    switch (n->type) {
+        case NODE_NUMBER: return (long)n->ival;
+        case NODE_IDENT:  return ct_get(n->name);
+        case NODE_BINOP: {
+            long l = eval_comptime(n->left);
+            long r = eval_comptime(n->right);
+            if (strcmp(n->op, "+") == 0) return l + r;
+            if (strcmp(n->op, "-") == 0) return l - r;
+            if (strcmp(n->op, "*") == 0) return l * r;
+            if (strcmp(n->op, "/") == 0) {
+                if (r == 0) { fprintf(stderr, "comptime error: division by zero\n"); exit(1); }
+                return l / r;
+            }
+            fprintf(stderr, "comptime error: unsupported op '%s'\n", n->op);
+            exit(1);
+        }
+        default:
+            fprintf(stderr, "comptime error: unsupported node type %d\n", n->type);
+            exit(1);
+    }
+}
+
+
 static Node *parse_block_body() {
     Node *block = new_node(NODE_BLOCK);
     while (peek()->type != TOK_END  &&
@@ -120,23 +168,57 @@ static Node *parse_block() {
 static Node *parse_statement() {
     Token *t = peek();
 
-    // ── let x: type = expr  /  let x = expr ──
+    // ── let x: type = expr  /  let x = expr  /  let nums: int[5] ──
     if (t->type == TOK_LET) {
         advance();
-        Token *name      = expect(TOK_IDENT, "variable name");
+        Token *name       = expect(TOK_IDENT, "variable name");
         DataType declared = parse_type_annotation();   // optional ': type'
-        expect(TOK_EQ, "=");
 
+        // ── array declaration: let nums: int[5]  OR  let nums: int[4] = {1,2,3,4} ──
+        if (peek()->type == TOK_LBRACKET) {
+            advance();  // consume '['
+            Token *sz  = expect(TOK_NUMBER, "array size");
+            int    asz = atoi(sz->value);
+            expect(TOK_RBRACKET, "]");
+
+            Node *n       = new_node(NODE_ARRAY_DECL);
+            strncpy(n->name, name->value, 63);
+            n->dtype      = (declared != DTYPE_UNKNOWN) ? declared : DTYPE_INT;
+            n->array_size = asz;
+
+            // optional initialiser: = {1, 2, 3, 4}
+            if (peek()->type == TOK_EQ) {
+                advance();  // consume '='
+                expect(TOK_LBRACE, "{");
+                Node *init       = new_node(NODE_ARRAY_INIT);
+                strncpy(init->name, name->value, 63);
+                init->dtype      = n->dtype;
+                init->array_size = asz;
+                while (peek()->type != TOK_RBRACE && peek()->type != TOK_EOF) {
+                    init->children[init->child_count++] = parse_expression();
+                    if (peek()->type == TOK_COMMA) advance();
+                }
+                expect(TOK_RBRACE, "}");
+                // return both nodes wrapped: decl first, then init
+                // we use a block node to carry both
+                Node *blk = new_node(NODE_BLOCK);
+                blk->children[blk->child_count++] = n;
+                blk->children[blk->child_count++] = init;
+                return blk;
+            }
+            return n;
+        }
+
+        // ── regular variable ──
+        expect(TOK_EQ, "=");
         Node *n = new_node(NODE_ASSIGN);
         strncpy(n->name, name->value, 63);
-        n->right = parse_expression();
+        n->right = parse_comparison();
 
         DataType inferred = infer_type(n->right);
-
         if (declared != DTYPE_UNKNOWN) {
-            // int literal assigned to float var is valid — we coerce in codegen
             int coerce_ok = (declared == DTYPE_FLOAT && inferred == DTYPE_INT) ||
-                (declared == DTYPE_BOOL   && inferred == DTYPE_INT);
+                            (declared == DTYPE_BOOL  && inferred == DTYPE_INT);
             if (!coerce_ok && inferred != DTYPE_UNKNOWN && declared != inferred) {
                 fprintf(stderr, "Type error: '%s' declared as type %d but value is type %d\n",
                         name->value, declared, inferred);
@@ -146,8 +228,13 @@ static Node *parse_statement() {
         } else {
             n->dtype = (inferred != DTYPE_UNKNOWN) ? inferred : DTYPE_INT;
         }
-
         n->right->dtype = n->dtype;
+
+        // if right side was a comptime (now folded to NODE_NUMBER),
+        // register this variable so other comptime exprs can use it
+        if (n->right->type == NODE_NUMBER)
+            ct_set(n->name, (long)n->right->ival);
+
         return n;
     }
 
@@ -228,6 +315,35 @@ static Node *parse_statement() {
         return n;
     }
 
+    // ── match x ... end ──
+    // cases: literal -> stmt  OR  else -> stmt
+    // NODE_MATCH.left = subject expression
+    // NODE_MATCH.children[] = NODE_MATCH_CASE nodes
+    //   NODE_MATCH_CASE.left  = value expr (NULL for else)
+    //   NODE_MATCH_CASE.right = body statement
+    if (t->type == TOK_MATCH) {
+        advance();
+        Node *n  = new_node(NODE_MATCH);
+        n->left  = parse_expression();   // subject: match x
+
+        while (peek()->type != TOK_END && peek()->type != TOK_EOF) {
+            Node *c = new_node(NODE_MATCH_CASE);
+
+            if (peek()->type == TOK_ELSE) {
+                advance();               // consume 'else'
+                c->left = NULL;          // NULL = else branch
+            } else {
+                c->left = parse_expression();  // case value
+            }
+
+            expect(TOK_ARROW, "->");     // consume '->'
+            c->right = parse_statement();// case body (single statement)
+            n->children[n->child_count++] = c;
+        }
+        expect(TOK_END, "end");
+        return n;
+    }
+
     // ── fn name(a: int, b: int) -> int ... end ──
     if (t->type == TOK_FN) {
         advance();
@@ -258,7 +374,7 @@ static Node *parse_statement() {
         return n;
     }
 
-    // ── ident(...) / ident = expr ──
+    // ── ident(...) / ident[i] = expr / ident = expr ──
     if (t->type == TOK_IDENT) {
         char name[64];
         strncpy(name, t->value, 63);
@@ -273,6 +389,18 @@ static Node *parse_statement() {
                 if (peek()->type == TOK_COMMA) advance();
             }
             expect(TOK_RPAREN, ")");
+            return n;
+        }
+
+        // ── array element assignment: nums[i] = val ──
+        if (peek()->type == TOK_LBRACKET) {
+            advance();  // consume '['
+            Node *n = new_node(NODE_ARRAY_ASSIGN);
+            strncpy(n->name, name, 63);
+            n->left  = parse_expression();   // index
+            expect(TOK_RBRACKET, "]");
+            expect(TOK_EQ, "=");
+            n->right = parse_expression();   // value
             return n;
         }
 
@@ -349,6 +477,19 @@ static Node *parse_term() {
 static Node *parse_factor() {
     Token *t = peek();
 
+    // ── comptime(expr) — evaluate at compile time, inline as constant ──
+    if (t->type == TOK_COMPTIME) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *inner = parse_expression();
+        expect(TOK_RPAREN, ")");
+        long val = eval_comptime(inner);   // evaluate NOW in compiler
+        Node *n  = new_node(NODE_NUMBER);  // replace with constant
+        n->ival  = (int)val;
+        n->dtype = DTYPE_INT;
+        return n;
+    }
+
     if (t->type == TOK_NUMBER) {
         advance();
         Node *n  = new_node(NODE_NUMBER);
@@ -388,6 +529,16 @@ static Node *parse_factor() {
                 if (peek()->type == TOK_COMMA) advance();
             }
             expect(TOK_RPAREN, ")");
+            return n;
+        }
+
+        // ── array element read: nums[i] in expression ──
+        if (peek()->type == TOK_LBRACKET) {
+            advance();  // consume '['
+            Node *n = new_node(NODE_ARRAY_ACCESS);
+            strncpy(n->name, name, 63);
+            n->left = parse_expression();   // index
+            expect(TOK_RBRACKET, "]");
             return n;
         }
 
