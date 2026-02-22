@@ -19,6 +19,9 @@ typedef enum {
     TOK_ELSE,
     TOK_WHILE,
     TOK_FOR,
+    TOK_DO,       // do
+
+
     TOK_TO,
     TOK_STEP,
     TOK_END,
@@ -28,6 +31,15 @@ typedef enum {
     TOK_MATCH,
     TOK_COMPTIME,
     TOK_STRUCT,     // struct
+    TOK_ADDR,       // addr
+    TOK_DEREF,      // deref
+    TOK_ALLOC,      // alloc
+    TOK_FREE,       // free
+                    
+    TOK_OPEN,
+    TOK_READ,
+    TOK_WRITE,
+    TOK_CLOSE,
 
     // operators
     TOK_PLUS,
@@ -60,7 +72,6 @@ typedef enum {
     TOK_TSTR,
     TOK_TPTR,
     TOK_TBOOL,
-
     TOK_EOF
 } TokenType;
 
@@ -141,6 +152,20 @@ typedef enum {
     NODE_STRUCT_INIT,   // Point(10, 20)
     NODE_FIELD_ACCESS,  // p.x  (in expression)
     NODE_FIELD_ASSIGN,  // p.x = val (statement)
+    NODE_ADDR,          // addr(x)        — take address
+    NODE_DEREF,         // deref(p)       — read through pointer
+    NODE_DEREF_ASSIGN,  // deref(p) = val — write through pointer
+    NODE_RETURN_MULTI,  // return a, b
+    NODE_ASSIGN_MULTI,  // let lo, hi = fn()
+    NODE_ALLOC,     // alloc(size)     — mmap syscall
+    NODE_FREE,      // free(ptr, size) — munmap syscall
+    NODE_OPEN,
+    NODE_READ,
+    NODE_WRITE,
+    NODE_CLOSE,
+
+    NODE_FOR_IF,  // for i = 0 to 100 if condition
+    NODE_DO_WHILE // do ... while condition
 } NodeType;
 
 typedef struct Node Node;

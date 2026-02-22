@@ -232,6 +232,61 @@ static Node *parse_statement() {
         return n;
     }
 
+// read(fd, buf, size)
+    if (t->type == TOK_READ) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_READ);
+        n->children[0] = parse_expression();   // fd
+        expect(TOK_COMMA, ",");
+        n->children[1] = parse_expression();   // buf
+        expect(TOK_COMMA, ",");
+        n->children[2] = parse_expression();   // size
+        n->child_count = 3;
+        expect(TOK_RPAREN, ")");
+        return n;
+    }
+
+    // write(fd, buf, size)
+    if (t->type == TOK_WRITE) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_WRITE);
+        n->children[0] = parse_expression();   // fd
+        expect(TOK_COMMA, ",");
+        n->children[1] = parse_expression();   // buf
+        expect(TOK_COMMA, ",");
+        n->children[2] = parse_expression();   // size
+        n->child_count = 3;
+        expect(TOK_RPAREN, ")");
+        return n;
+    }
+
+    // close(fd)
+    if (t->type == TOK_CLOSE) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_CLOSE);
+        n->left = parse_expression();   // fd
+        expect(TOK_RPAREN, ")");
+        return n;
+    }
+
+    // do ... while condition
+    if (t->type == TOK_DO) {
+        advance();
+        Node *n  = new_node(NODE_DO_WHILE);
+        // parse body until 'while' — not 'end'
+        Node *body = new_node(NODE_BLOCK);
+        while (peek()->type != TOK_WHILE && peek()->type != TOK_EOF)
+            body->children[body->child_count++] = parse_statement();
+        n->right = body;
+        expect(TOK_WHILE, "while");
+        n->left  = parse_comparison();
+        return n;
+    }
+
+
     // ── let x: type = expr  /  let x = expr  /  let nums: int[5] ──
     if (t->type == TOK_LET) {
         advance();
@@ -270,12 +325,20 @@ static Node *parse_statement() {
             return n;
         }
 
-        // ── regular variable ──
+        if (peek()->type == TOK_COMMA) {
+            advance();
+            Token *name2 = expect(TOK_IDENT, "second variable name");
+            expect(TOK_EQ, "=");
+            Node *n = new_node(NODE_ASSIGN_MULTI);
+            strncpy(n->name, name->value, 63);
+            strncpy(n->sval, name2->value, 63);
+            n->right = parse_expression();
+            return n;
+        }
         expect(TOK_EQ, "=");
         Node *n = new_node(NODE_ASSIGN);
         strncpy(n->name, name->value, 63);
         n->right = parse_comparison();
-
         DataType inferred = infer_type(n->right);
 
         if (declared != DTYPE_UNKNOWN) {
@@ -304,12 +367,46 @@ static Node *parse_statement() {
 
         return n;
     }
+// deref(p) = val — write through pointer
+    if (t->type == TOK_DEREF) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Token *var = expect(TOK_IDENT, "variable name");
+        expect(TOK_RPAREN, ")");
+        expect(TOK_EQ, "=");
+        Node *n = new_node(NODE_DEREF_ASSIGN);
+        strncpy(n->name, var->value, 63);
+        n->right = parse_expression();
+        return n;
+    }
+
+// free(ptr, size) — munmap syscall
+    if (t->type == TOK_FREE) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_FREE);
+        n->left  = parse_expression();   // ptr
+        expect(TOK_COMMA, ",");
+        n->right = parse_expression();   // size
+        expect(TOK_RPAREN, ")");
+        return n;
+    }
+
 
     // ── return expr ──
     if (t->type == TOK_RETURN) {
         advance();
+        Node *first = parse_expression();
+        if (peek()->type == TOK_COMMA) {
+            advance();
+            Node *n = new_node(NODE_RETURN_MULTI);
+            n->children[0] = first;
+            n->children[1] = parse_expression();
+            n->child_count = 2;
+            return n;
+        }
         Node *n  = new_node(NODE_RETURN);
-        n->right = parse_expression();
+        n->right = first;
         return n;
     }
 
@@ -376,6 +473,19 @@ static Node *parse_statement() {
             n->children[2] = one;
         }
         n->child_count = 3;
+        // optional if condition: for i = 0 to 100 if i % 2 == 0
+        if (peek()->type == TOK_IF) {
+            advance();
+            Node *fi = new_node(NODE_FOR_IF);
+            fi->children[0] = n->children[0];
+            fi->children[1] = n->children[1];
+            fi->children[2] = n->children[2];
+            strncpy(fi->name, n->name, 63);
+            fi->left = parse_comparison();
+            fi->children[3] = parse_block();
+            fi->child_count = 4;
+            return fi;
+        }
         n->children[3] = parse_block();
         n->child_count = 4;
         return n;
@@ -422,9 +532,14 @@ static Node *parse_statement() {
         }
         expect(TOK_RPAREN, ")");
 
-        if (peek()->type == TOK_ARROW) {
+       if (peek()->type == TOK_ARROW) {
             advance();
             n->dtype = parse_type_keyword();
+            // skip second return type if present — e.g. -> int, int
+            if (peek()->type == TOK_COMMA) {
+                advance();
+                parse_type_keyword();   // consume second type, ignore for now
+            }
         }
         n->right = parse_block();
         return n;
@@ -557,6 +672,54 @@ static Node *parse_factor() {
         Node *n  = new_node(NODE_NUMBER);
         n->ival  = (int)val;
         n->dtype = DTYPE_INT;
+        return n;
+    }
+
+
+// open(filename, flags) — returns fd
+    if (t->type == TOK_OPEN) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_OPEN);
+        n->left  = parse_expression();   // filename
+        expect(TOK_COMMA, ",");
+        n->right = parse_expression();   // flags
+        expect(TOK_RPAREN, ")");
+        n->dtype = DTYPE_INT;
+        return n;
+    }
+// addr(x) — take address of variable
+    if (t->type == TOK_ADDR) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Token *var = expect(TOK_IDENT, "variable name");
+        expect(TOK_RPAREN, ")");
+        Node *n = new_node(NODE_ADDR);
+        strncpy(n->name, var->value, 63);
+        n->dtype = DTYPE_PTR;
+        return n;
+    }
+
+    // deref(p) — read through pointer
+    if (t->type == TOK_DEREF) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Token *var = expect(TOK_IDENT, "variable name");
+        expect(TOK_RPAREN, ")");
+        Node *n = new_node(NODE_DEREF);
+        strncpy(n->name, var->value, 63);
+        n->dtype = DTYPE_INT;
+        return n;
+    }
+
+// alloc(size) — mmap syscall
+    if (t->type == TOK_ALLOC) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n = new_node(NODE_ALLOC);
+        n->left = parse_expression();   // size
+        expect(TOK_RPAREN, ")");
+        n->dtype = DTYPE_PTR;
         return n;
     }
 

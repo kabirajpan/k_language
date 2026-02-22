@@ -41,6 +41,15 @@ static int is_keyword(const char *s, TokenType *out) {
     if (strcmp(s, "match")    == 0) { *out = TOK_MATCH;    return 1; }
     if (strcmp(s, "comptime") == 0) { *out = TOK_COMPTIME; return 1; }
     if (strcmp(s, "struct")   == 0) { *out = TOK_STRUCT;   return 1; }
+    if (strcmp(s, "addr")     == 0) { *out = TOK_ADDR;     return 1; }
+    if (strcmp(s, "deref")    == 0) { *out = TOK_DEREF;    return 1; }
+    if (strcmp(s, "alloc")    == 0) { *out = TOK_ALLOC;    return 1; }
+    if (strcmp(s, "free")     == 0) { *out = TOK_FREE;     return 1; }
+    if (strcmp(s, "open")     == 0) { *out = TOK_OPEN;     return 1; }
+    if (strcmp(s, "read")     == 0) { *out = TOK_READ;     return 1; }
+    if (strcmp(s, "write")    == 0) { *out = TOK_WRITE;    return 1; }
+    if (strcmp(s, "close")    == 0) { *out = TOK_CLOSE;    return 1; }
+    if (strcmp(s, "do")       == 0) { *out = TOK_DO;       return 1; }
     return 0;
 }
 

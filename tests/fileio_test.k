@@ -1,0 +1,6 @@
+let buf: ptr = alloc(1024)
+let fd = open("tests/hello.txt", 0)
+read(fd, buf, 16)
+write(1, buf, 16)
+close(fd)
+free(buf, 1024)

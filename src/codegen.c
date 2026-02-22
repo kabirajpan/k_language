@@ -60,7 +60,7 @@ static void emit_jmp(const char *instr, int id) {
 static int label_count = 0;
 static int str_count   = 0;
 
-typedef struct { char name[64]; int offset; int array_size; char struct_type[64]; DataType dtype; } Var;
+typedef struct { char name[64]; int offset; int array_size; char struct_type[64]; DataType dtype; int owned; } Var;
 static Var var_table[256];
 static int var_count  = 0;
 static int stack_top  = 0;
@@ -70,18 +70,18 @@ static int param_count = 0;
 static int new_label() { return label_count++; }
 
 static int var_offset(const char *name) {
-    for (int i = 0; i < var_count; i++)
+    for (int i = var_count - 1; i >= 0; i--)
         if (strcmp(var_table[i].name, name) == 0) return var_table[i].offset;
-    for (int i = 0; i < param_count; i++)
+    for (int i = param_count - 1; i >= 0; i--)
         if (strcmp(param_table[i].name, name) == 0) return param_table[i].offset;
     fprintf(stderr, "Codegen error: undefined variable '%s'\n", name);
     exit(1);
 }
 
 static DataType var_dtype(const char *name) {
-    for (int i = 0; i < var_count; i++)
+    for (int i = var_count - 1; i >= 0; i--)
         if (strcmp(var_table[i].name, name) == 0) return var_table[i].dtype;
-    for (int i = 0; i < param_count; i++)
+    for (int i = param_count - 1; i >= 0; i--)
         if (strcmp(param_table[i].name, name) == 0) return param_table[i].dtype;
     return DTYPE_INT;
 }
@@ -148,7 +148,9 @@ static int count_vars(Node *n) {
     if (n->type == NODE_ARRAY_DECL)  count = n->array_size;
     if (n->type == NODE_ARRAY_INIT)  count = 0;
     if (n->type == NODE_STRUCT_DEF)  count = 0;  // no stack space
+    if (n->type == NODE_ASSIGN_MULTI) count = 2;
     if (n->type == NODE_FOR)         count = 1;
+    if (n->type == NODE_FOR_IF)      count = 1;
     if (n->left)  count += count_vars(n->left);
     if (n->right) count += count_vars(n->right);
     for (int i = 0; i < n->child_count; i++)
@@ -170,6 +172,121 @@ static void emit_cmp(const char *op) {
     else if (strcmp(op, "<=") == 0) emitln("setle al");
     emitln("movzx rax, al");
 }
+
+// CSE cache — stores recently computed binop expressions
+typedef struct {
+    char lhs[64];   // left operand name
+    char rhs[64];   // right operand name  
+    char op[4];     // operator
+    int  slot;      // r11=0, r12 already used by for, use r11
+} CSEEntry;
+static CSEEntry cse_cache[32];
+static int      cse_count = 0;
+
+static void cse_clear() { cse_count = 0; }
+
+static int cse_lookup(const char *lhs, const char *op, const char *rhs) {
+    for (int i = 0; i < cse_count; i++)
+        if (strcmp(cse_cache[i].lhs, lhs) == 0 &&
+            strcmp(cse_cache[i].op,  op)  == 0 &&
+            strcmp(cse_cache[i].rhs, rhs) == 0)
+            return i;
+    return -1;
+}
+
+static void cse_store(const char *lhs, const char *op, const char *rhs) {
+    if (cse_count >= 32) return;
+    strncpy(cse_cache[cse_count].lhs, lhs, 63);
+    strncpy(cse_cache[cse_count].op,  op,  3);
+    strncpy(cse_cache[cse_count].rhs, rhs, 63);
+    cse_count++;
+}
+
+// ─────────────────────────────────────────
+// Linear Scan Register Allocator
+// Based on Poletto & Sarkar 1999
+// ─────────────────────────────────────────
+#define MAX_REGS 2
+static const char *alloc_regs[MAX_REGS] = {"r12", "r13"};
+
+typedef struct {
+    char name[64];  // variable name
+    int  start;     // first use (instruction index)
+    int  end;       // last use (instruction index)
+    int  reg;       // assigned register index (-1 = spilled to RAM)
+} LiveInterval;
+
+static LiveInterval intervals[256];
+static int          interval_count = 0;
+static int          reg_free[MAX_REGS];   // 1 = free, 0 = in use
+static char         reg_owner[MAX_REGS][64]; // which var owns this reg
+
+static void regalloc_clear() {
+    interval_count = 0;
+    for (int i = 0; i < MAX_REGS; i++) {
+        reg_free[i] = 1;
+        reg_owner[i][0] = 0;
+    }
+}
+
+// find which register a variable is in (-1 = not in register)
+static int regalloc_find(const char *name) {
+    for (int i = 0; i < MAX_REGS; i++)
+        if (!reg_free[i] && strcmp(reg_owner[i], name) == 0)
+            return i;
+    return -1;
+}
+
+// assign a register to a variable — returns reg index or -1 if none free
+static int regalloc_assign(const char *name) {
+    // already assigned?
+    int existing = regalloc_find(name);
+    if (existing >= 0) return existing;
+    // find free register
+    for (int i = 0; i < MAX_REGS; i++) {
+        if (reg_free[i]) {
+            reg_free[i] = 0;
+            strncpy(reg_owner[i], name, 63);
+            return i;
+        }
+    }
+    return -1;  // no register free — spill
+}
+
+// free a register when variable goes out of use
+static void regalloc_free(const char *name) {
+    for (int i = 0; i < MAX_REGS; i++) {
+        if (!reg_free[i] && strcmp(reg_owner[i], name) == 0) {
+            reg_free[i] = 1;
+            reg_owner[i][0] = 0;
+            return;
+        }
+    }
+}
+
+// forward declaration
+static int node_uses_var(Node *n, const char *varname);
+
+// returns 1 if node accesses an array using varname as index
+static int block_accesses_array(Node *n, const char *varname) {
+    if (!n) return 0;
+    if (n->type == NODE_ARRAY_ACCESS && node_uses_var(n->left, varname)) return 1;
+    if (n->type == NODE_ARRAY_ASSIGN && node_uses_var(n->left, varname)) return 1;
+    if (block_accesses_array(n->left,  varname)) return 1;
+    if (block_accesses_array(n->right, varname)) return 1;
+    for (int i = 0; i < n->child_count; i++)
+        if (block_accesses_array(n->children[i], varname)) return 1;
+    return 0;
+}
+
+// returns loop range if known at compile time, -1 if not
+static int get_loop_range(Node *limit, Node *start) {
+    if (limit->type == NODE_NUMBER && start->type == NODE_NUMBER)
+        return limit->ival - start->ival;
+    return -1;
+}
+
+
 
 // ─────────────────────────────────────────
 // Code generation
@@ -199,6 +316,14 @@ static void gen_expr(Node *n) {
         int off      = var_offset(n->name);
         DataType dt  = var_dtype(n->name);
         n->dtype     = dt;
+        // check if variable lives in a register
+        int reg = regalloc_find(n->name);
+        if (reg >= 0 && dt == DTYPE_INT) {
+            emit("mov rax, ");
+            buf_write_str(out_buf, &out_cursor, alloc_regs[reg]);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            break;
+        }
         if (dt == DTYPE_FLOAT) {
             // load float into xmm0, then transfer bits to rax for uniform handling
             emit("movsd xmm0, [rbp-");
@@ -227,7 +352,7 @@ static void gen_expr(Node *n) {
         buf_write_int(str_buf, &str_cursor, sid);
         buf_write_str(str_buf, &str_cursor, " db \"");
         buf_write_str(str_buf, &str_cursor, n->sval);
-        buf_write_str(str_buf, &str_cursor, "\", 10, 0\n");
+        buf_write_str(str_buf, &str_cursor, "\", 0\n");
         // load address into rax
         emit("lea rax, [rel str");
         buf_write_int(out_buf, &out_cursor, sid);
@@ -240,15 +365,30 @@ static void gen_expr(Node *n) {
     // address of nums[i] = rbp - (base + i*8)
     case NODE_ARRAY_ACCESS: {
         int base = var_offset(n->name);
-        gen_expr(n->left);
-        emitln("imul rax, 8");
-        emitln("neg rax");
-        emit("add rax, ");
-        buf_write_str(out_buf, &out_cursor, "qword -");
-        buf_write_int(out_buf, &out_cursor, base);
-        buf_write_str(out_buf, &out_cursor, "\n");
-        emitln("add rax, rbp");
-        emitln("mov rax, [rax]");
+        DataType dt = var_dtype(n->name);
+        if (dt == DTYPE_PTR) {
+            // pointer indexing: ptr[i] = *(ptr + i*8)
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, base);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("push rax");         // save ptr
+            gen_expr(n->left);          // index → rax
+            emitln("shl rax, 3");       // i * 8 = i << 3     
+            emitln("pop rbx");          // ptr → rbx
+            emitln("add rbx, rax");     // ptr + i*8
+            emitln("mov rax, [rbx]");   // load value
+        } else {
+            // stack array indexing
+            gen_expr(n->left);
+            emitln("shl rax, 3");
+            emitln("neg rax");
+            emit("add rax, ");
+            buf_write_str(out_buf, &out_cursor, "qword -");
+            buf_write_int(out_buf, &out_cursor, base);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            emitln("add rax, rbp");
+            emitln("mov rax, [rax]");
+        }
         n->dtype = var_dtype(n->name);
         break;
     }
@@ -277,27 +417,59 @@ static void gen_expr(Node *n) {
     }
 
     // ── binary operation ──
-    // FIX: use r10 for simple right-hand sides to avoid push/pop
-    // fall back to push/pop for nested expressions to avoid r10 clobbering
-    case NODE_BINOP:
-        gen_expr(n->left);
-        if (n->right->type == NODE_BINOP || n->right->type == NODE_FN_CALL) {
-            emitln("push rax");
-            gen_expr(n->right);
-            emitln("mov rbx, rax");
-            emitln("pop rax");
-        } else {
-            emitln("mov r10, rax");
-            gen_expr(n->right);
-            emitln("mov rbx, rax");
-            emitln("mov rax, r10");
+    case NODE_BINOP: {
+        // CSE — check if both sides are simple idents and we've seen this before
+        char lhs[64] = "", rhs[64] = "";
+        int use_cse = 0;
+        if (n->left->type  == NODE_IDENT) strncpy(lhs, n->left->name,  63);
+        if (n->right->type == NODE_IDENT) strncpy(rhs, n->right->name, 63);
+        if (lhs[0] && rhs[0]) {
+            int hit = cse_lookup(lhs, n->op, rhs);
+            if (hit >= 0) {
+                // reuse cached result from r11
+                emitln("mov rax, r11");
+                use_cse = 1;
+            }
         }
-        if      (strcmp(n->op, "+") == 0) emitln("add rax, rbx");
-        else if (strcmp(n->op, "-") == 0) emitln("sub rax, rbx");
-        else if (strcmp(n->op, "*") == 0) emitln("imul rax, rbx");
-        else if (strcmp(n->op, "/") == 0) { emitln("xor rdx, rdx"); emitln("idiv rbx"); }
-        else                              emit_cmp(n->op);
+        if (!use_cse) {
+            gen_expr(n->left);
+            if (n->right->type == NODE_BINOP || n->right->type == NODE_FN_CALL) {
+                emitln("push rax");
+                gen_expr(n->right);
+                emitln("mov rbx, rax");
+                emitln("pop rax");
+            } else {
+                emitln("mov r10, rax");
+                gen_expr(n->right);
+                emitln("mov rbx, rax");
+                emitln("mov rax, r10");
+            }
+            if      (strcmp(n->op, "+") == 0) emitln("add rax, rbx");
+            else if (strcmp(n->op, "-") == 0) emitln("sub rax, rbx");
+            else if (strcmp(n->op, "*") == 0) {
+                if (n->right->type == NODE_NUMBER) {
+                    int val = n->right->ival;
+                    if      (val == 2)  emitln("shl rax, 1");
+                    else if (val == 4)  emitln("shl rax, 2");
+                    else if (val == 8)  emitln("shl rax, 3");
+                    else if (val == 16) emitln("shl rax, 4");
+                    else if (val == 32) emitln("shl rax, 5");
+                    else if (val == 64) emitln("shl rax, 6");
+                    else emitln("imul rax, rbx");
+                } else {
+                    emitln("imul rax, rbx");
+                }
+            }
+            else if (strcmp(n->op, "/") == 0) { emitln("xor rdx, rdx"); emitln("idiv rbx"); }
+            else emit_cmp(n->op);
+            // cache this result in r11 if both sides were simple idents
+            if (lhs[0] && rhs[0]) {
+                emitln("mov r11, rax");
+                cse_store(lhs, n->op, rhs);
+            }
+        }
         break;
+    }
 
     // ── function call ──
     case NODE_FN_CALL: {
@@ -317,10 +489,85 @@ static void gen_expr(Node *n) {
         break;
     }
 
+// addr(x) — load address of variable into rax
+    case NODE_ADDR: {
+        int off = var_offset(n->name);
+        emit("lea rax, [rbp-");
+        buf_write_int(out_buf, &out_cursor, off);
+        buf_write_str(out_buf, &out_cursor, "]\n");
+        n->dtype = DTYPE_PTR;
+        break;
+    }
+
+    // deref(p) — read value from address stored in variable
+    case NODE_DEREF: {
+        int off = var_offset(n->name);
+        emit("mov rax, [rbp-");
+        buf_write_int(out_buf, &out_cursor, off);
+        buf_write_str(out_buf, &out_cursor, "]\n");
+        emitln("mov rax, [rax]");
+        n->dtype = DTYPE_INT;
+        break;
+    }
+
+// alloc(size) — mmap syscall
+    // syscall 9 = mmap(addr=0, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    case NODE_ALLOC: {
+        gen_expr(n->left);              // size → rax
+        emitln("mov rdi, 0");           // addr = 0 (kernel chooses)
+        emitln("mov rsi, rax");         // size
+        emitln("mov rdx, 3");           // PROT_READ | PROT_WRITE
+        emitln("mov r10, 34");          // MAP_PRIVATE | MAP_ANONYMOUS
+        emitln("mov r8, -1");           // fd = -1
+        emitln("mov r9, 0");            // offset = 0
+        emitln("mov rax, 9");           // syscall 9 = mmap
+        emitln("syscall");              // rax = pointer to memory
+        n->dtype = DTYPE_PTR;
+        break;
+    }
+
+// open(filename, flags) — syscall 2
+    case NODE_OPEN: {
+        gen_expr(n->left);              // filename → rax
+        emitln("mov rdi, rax");         // filename
+        gen_expr(n->right);             // flags → rax
+        emitln("mov rsi, rax");         // flags
+        emitln("mov rdx, 0");           // mode = 0
+        emitln("mov rax, 2");           // syscall 2 = open
+        emitln("syscall");              // rax = fd
+        n->dtype = DTYPE_INT;
+        break;
+    }
+
     default:
         fprintf(stderr, "Codegen error: unexpected node in expression\n");
         exit(1);
     }
+}
+
+static void emit_auto_free() {
+    for (int i = 0; i < var_count; i++) {
+        if (var_table[i].dtype == DTYPE_PTR && var_table[i].owned) {
+            emit("mov rdi, [rbp-");
+            buf_write_int(out_buf, &out_cursor, var_table[i].offset);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("mov rsi, 1024");    // size — we store this later
+            emitln("mov rax, 11");      // munmap
+            emitln("syscall");
+        }
+    }
+}
+
+
+// returns 1 if node tree references variable name
+static int node_uses_var(Node *n, const char *varname) {
+    if (!n) return 0;
+    if (n->type == NODE_IDENT && strcmp(n->name, varname) == 0) return 1;
+    if (node_uses_var(n->left,  varname)) return 1;
+    if (node_uses_var(n->right, varname)) return 1;
+    for (int i = 0; i < n->child_count; i++)
+        if (node_uses_var(n->children[i], varname)) return 1;
+    return 0;
 }
 
 static void gen_stmt(Node *n) {
@@ -354,17 +601,38 @@ static void gen_stmt(Node *n) {
     // address = rbp - (base + i*8)
     case NODE_ARRAY_ASSIGN: {
         int base = var_offset(n->name);
-        gen_expr(n->right);               // value → rax
-        emitln("push rax");               // save value
-        gen_expr(n->left);                // index → rax
-        emitln("imul rax, 8");            // i * 8
-        emitln("neg rax");                // -(i*8)
-        emit("add rax, qword -");
-        buf_write_int(out_buf, &out_cursor, base);
-        buf_write_str(out_buf, &out_cursor, "\n");
-        emitln("add rax, rbp");           // rax = address of nums[i]
-        emitln("pop rbx");                // restore value into rbx
-        emitln("mov [rax], rbx");         // store value
+        DataType dt = var_dtype(n->name);
+        if (dt == DTYPE_PTR) {
+            // pointer indexing write: ptr[i] = val
+            gen_expr(n->right);             // value → rax
+            emitln("push rax");             // save value
+            emit("mov rax, [rbp-");         // load ptr
+            buf_write_int(out_buf, &out_cursor, base);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            gen_expr(n->left);              // index → rax — WRONG, clobbers ptr
+            emitln("push rax");             // save index
+            emit("mov rax, [rbp-");         // reload ptr
+            buf_write_int(out_buf, &out_cursor, base);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("pop rcx");              // index → rcx
+            emitln("shl rcx, 3");           // i * 8 = i << 3
+            emitln("add rax, rcx");         // ptr + i*8
+            emitln("pop rbx");              // value → rbx
+            emitln("mov [rax], rbx");       // store
+        } else {
+            // stack array write
+            gen_expr(n->right);
+            emitln("push rax");
+            gen_expr(n->left);
+            emitln("shl rax, 3");
+            emitln("neg rax");
+            emit("add rax, qword -");
+            buf_write_int(out_buf, &out_cursor, base);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            emitln("add rax, rbp");
+            emitln("pop rbx");
+            emitln("mov [rax], rbx");
+        }
         break;
     }
 
@@ -410,11 +678,14 @@ static void gen_stmt(Node *n) {
             emit("mov byte [rbp-");
             buf_write_int(out_buf, &out_cursor, off);
             buf_write_str(out_buf, &out_cursor, "], al\n");
-        } else {
+          } else {
             gen_expr(n->right);
             emit("mov [rbp-");
             buf_write_int(out_buf, &out_cursor, off);
             buf_write_str(out_buf, &out_cursor, "], rax\n");
+            // mark as owned if allocated with alloc
+            if (n->right->type == NODE_ALLOC)
+                var_table[var_count - 1].owned = 1;
         }
         break;
     }
@@ -472,8 +743,8 @@ static void gen_stmt(Node *n) {
                        (n->right->type == NODE_IDENT &&
                         var_dtype(n->right->name) == DTYPE_BOOL);
         if (is_str) {
-            // rax has string pointer — pass as rdi directly
-            emitln("mov rdi, rax");
+            emitln("mov rsi, rax");
+            emitln("lea rdi, [rel fmts]");
             emitln("xor rax, rax");
             emitln("call printf");
         } else if (is_float) {
@@ -558,9 +829,21 @@ static void gen_stmt(Node *n) {
 
         gen_expr(n->children[0]);                   // eval start
         int off = add_var(n->name, DTYPE_INT);
-        emit("mov [rbp-");
-        buf_write_int(out_buf, &out_cursor, off);
-        buf_write_str(out_buf, &out_cursor, "], rax\n");
+        int loop_reg = regalloc_assign(n->name);
+        if (loop_reg >= 0) {
+            // store in register
+            emit("mov ");
+            buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+            buf_write_str(out_buf, &out_cursor, ", rax\n");
+            // also store to RAM as backup
+            emit("mov [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+        } else {
+            emit("mov [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+        }
 
         gen_expr(n->children[1]);                   // hoist limit → r14
         emitln("mov r14, rax");
@@ -568,27 +851,149 @@ static void gen_stmt(Node *n) {
         gen_expr(n->children[2]);                   // hoist step → r15
         emitln("mov r15, rax");
 
-        emit_jmp("jmp", lbl_check);                 // enter at condition
+        // loop tiling — detect if we should tile this loop
+        int tile_size = 64;
+        int should_tile = 0;
+        int loop_range = get_loop_range(n->children[1], n->children[0]);
+        if (loop_range > 128 &&
+            n->children[2]->type == NODE_NUMBER &&
+            n->children[2]->ival == 1 &&
+            block_accesses_array(n->children[3], n->name)) {
+            should_tile = 1;
+        }
 
-        emit_label(lbl_body);
-        gen_stmt(n->children[3]);                   // body
+        // loop invariant code motion
+        Node *body = n->children[3];
+        int hoisted[64] = {0};
+        if (body->type == NODE_BLOCK) {
+            for (int i = 0; i < body->child_count; i++) {
+                Node *stmt = body->children[i];
+                if (stmt->type == NODE_ASSIGN &&
+                    !node_uses_var(stmt->right, n->name)) {
+                    gen_stmt(stmt);
+                    hoisted[i] = 1;
+                }
+            }
+        }
 
-        emit("mov rax, [rbp-");                     // i = i + step
-        buf_write_int(out_buf, &out_cursor, off);
-        buf_write_str(out_buf, &out_cursor, "]\n");
-        emitln("add rax, r15");
-        emit("mov [rbp-");
-        buf_write_int(out_buf, &out_cursor, off);
-        buf_write_str(out_buf, &out_cursor, "], rax\n");
+        if (should_tile) {
+            // tiled loop — outer iterates over blocks, inner over elements
+            int lbl_outer_body  = new_label();
+            int lbl_outer_check = new_label();
+            int lbl_inner_body  = new_label();
+            int lbl_inner_check = new_label();
 
-        emit_label(lbl_check);                      // condition at bottom
-        emit("mov rax, [rbp-");
-        buf_write_int(out_buf, &out_cursor, off);
-        buf_write_str(out_buf, &out_cursor, "]\n");
-        emitln("cmp rax, r14");
-        emit_jmp("jle", lbl_body);
+            // outer loop: block = start to limit step tile_size
+            // block var stored at off (reuse loop var slot)
+            emit_jmp("jmp", lbl_outer_check);
+            emit_label(lbl_outer_body);
+
+            // inner loop: i = block to min(block+tile_size, limit)
+            // compute inner limit = min(block + tile_size, r14)
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emit("add rax, ");
+            buf_write_int(out_buf, &out_cursor, tile_size);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            emitln("cmp rax, r14");
+            emitln("cmovg rax, r14");       // min(block+tile, limit)
+            emitln("push rax");             // save inner limit
+
+            // inner loop variable — reuse a temp stack slot
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("push rax");             // save inner start
+
+            emit_jmp("jmp", lbl_inner_check);
+            emit_label(lbl_inner_body);
+
+            // emit body with inner i on stack
+            if (body->type == NODE_BLOCK) {
+                for (int i = 0; i < body->child_count; i++) {
+                    if (hoisted[i]) continue;
+                    gen_stmt(body->children[i]);
+                }
+            } else {
+                gen_stmt(body);
+            }
+
+            // inner i++
+            emitln("mov rax, [rsp]");
+            emitln("add rax, 1");
+            emitln("mov [rsp], rax");
+
+            emit_label(lbl_inner_check);
+            emitln("mov rax, [rsp]");
+            emitln("cmp rax, [rsp+8]");
+            emit_jmp("jl", lbl_inner_body);
+
+            emitln("add rsp, 16");          // clean up inner limit + start
+
+            // outer block += tile_size
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emit("add rax, ");
+            buf_write_int(out_buf, &out_cursor, tile_size);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            emit("mov [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+
+            emit_label(lbl_outer_check);
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("cmp rax, r14");
+            emit_jmp("jl", lbl_outer_body);
+
+        } else {
+            emit_jmp("jmp", lbl_check);
+            emit_label(lbl_body);
+
+            if (body->type == NODE_BLOCK) {
+                for (int i = 0; i < body->child_count; i++) {
+                    if (hoisted[i]) continue;
+                    gen_stmt(body->children[i]);
+                }
+            } else {
+                gen_stmt(body);
+            }
+
+            if (loop_reg >= 0) {
+                emit("add ");
+                buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+                buf_write_str(out_buf, &out_cursor, ", r15\n");
+                emit("mov rax, ");
+                buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+                buf_write_str(out_buf, &out_cursor, "\n");
+                emit("mov [rbp-");
+                buf_write_int(out_buf, &out_cursor, off);
+                buf_write_str(out_buf, &out_cursor, "], rax\n");
+            } else {
+                emit("mov rax, [rbp-");
+                buf_write_int(out_buf, &out_cursor, off);
+                buf_write_str(out_buf, &out_cursor, "]\n");
+                emitln("add rax, r15");
+                emit("mov [rbp-");
+                buf_write_int(out_buf, &out_cursor, off);
+                buf_write_str(out_buf, &out_cursor, "], rax\n");
+            }
+
+            emit_label(lbl_check);
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("cmp rax, r14");
+            emit_jmp("jle", lbl_body);
+        }  // end else (non-tiled)
+
+        regalloc_free(n->name);
         break;
     }
+          
 
     // ── function definition ──
     case NODE_FN_DEF: {
@@ -596,7 +1001,7 @@ static void gen_stmt(Node *n) {
         int saved_var_count = var_count;
         int saved_stack_top = stack_top;
         memcpy(saved_vars, var_table, sizeof(Var) * var_count);
-        var_count = 0; stack_top = 0; param_count = 0;
+        var_count = 0; stack_top = 0; param_count = 0; cse_clear(); regalloc_clear();
 
         const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 
@@ -630,6 +1035,7 @@ static void gen_stmt(Node *n) {
         }
 
         gen_stmt(n->right);
+        emit_auto_free();
         emitln("xor rax, rax");
         emitln("mov rsp, rbp");
         emitln("pop rbp");
@@ -698,6 +1104,169 @@ static void gen_stmt(Node *n) {
         break;
     }
 
+// deref(p) = val — write value to address stored in variable
+    case NODE_DEREF_ASSIGN: {
+        int off = var_offset(n->name);
+        gen_expr(n->right);             // value → rax
+        emitln("mov rbx, rax");         // save value in rbx
+        emit("mov rax, [rbp-");         // load pointer
+        buf_write_int(out_buf, &out_cursor, off);
+        buf_write_str(out_buf, &out_cursor, "]\n");
+        emitln("mov [rax], rbx");       // write value to address
+        break;
+    }
+
+
+  // free(ptr, size) — munmap syscall
+    case NODE_FREE: {
+        gen_expr(n->left);              // ptr → rax
+        emitln("mov rdi, rax");         // addr
+        gen_expr(n->right);             // size → rax
+        emitln("mov rsi, rax");         // size
+        emitln("mov rax, 11");          // syscall 11 = munmap
+        emitln("syscall");
+        break;
+    }
+
+    // read(fd, buf, size) — syscall 0
+    case NODE_READ: {
+        gen_expr(n->children[0]);       // fd → rax
+        emitln("mov rdi, rax");         // fd
+        gen_expr(n->children[1]);       // buf → rax
+        emitln("mov rsi, rax");         // buf
+        gen_expr(n->children[2]);       // size → rax
+        emitln("mov rdx, rax");         // size
+        emitln("mov rax, 0");           // syscall 0 = read
+        emitln("syscall");
+        break;
+    }
+
+    // write(fd, buf, size) — syscall 1
+    case NODE_WRITE: {
+        gen_expr(n->children[0]);       // fd → rax
+        emitln("mov rdi, rax");         // fd
+        gen_expr(n->children[1]);       // buf → rax
+        emitln("mov rsi, rax");         // buf
+        gen_expr(n->children[2]);       // size → rax
+        emitln("mov rdx, rax");         // size
+        emitln("mov rax, 1");           // syscall 1 = write
+        emitln("syscall");
+        break;
+    }
+
+    // close(fd) — syscall 3
+    case NODE_CLOSE: {
+        gen_expr(n->left);              // fd → rax
+        emitln("mov rdi, rax");         // fd
+        emitln("mov rax, 3");           // syscall 3 = close
+        emitln("syscall");
+        break;
+    }
+
+// return a, b — put first value in rax, second in rdx
+    case NODE_RETURN_MULTI: {
+        gen_expr(n->children[0]);       // first value → rax
+        emitln("push rax");             // save first
+        gen_expr(n->children[1]);       // second value → rax
+        emitln("mov rdx, rax");         // second → rdx
+        emitln("pop rax");              // first → rax
+        emitln("mov rsp, rbp");
+        emitln("pop rbp");
+        emitln("ret");
+        break;
+    }
+
+    // let lo, hi = fn() — rax has first, rdx has second
+    case NODE_ASSIGN_MULTI: {
+        gen_expr(n->right);             // call fn — rax=first, rdx=second
+        emitln("push rdx");             // save second
+        int off1 = add_var(n->name, DTYPE_INT);
+        emit("mov [rbp-");
+        buf_write_int(out_buf, &out_cursor, off1);
+        buf_write_str(out_buf, &out_cursor, "], rax\n");
+        emitln("pop rax");              // restore second
+        int off2 = add_var(n->sval, DTYPE_INT);
+        emit("mov [rbp-");
+        buf_write_int(out_buf, &out_cursor, off2);
+        buf_write_str(out_buf, &out_cursor, "], rax\n");
+        break;
+    }
+
+    // do ... while condition
+    case NODE_DO_WHILE: {
+        int lbl_start = new_label();
+        emit_label(lbl_start);
+        gen_stmt(n->right);             // body always runs first
+        gen_expr(n->left);              // condition
+        emitln("test rax, rax");
+        emit_jmp("jnz", lbl_start);    // loop if true
+        break;
+    }
+
+    // for i = 0 to 100 if condition
+    case NODE_FOR_IF: {
+        int lbl_body  = new_label();
+        int lbl_check = new_label();
+
+        gen_expr(n->children[0]);                   // start
+        int off = add_var(n->name, DTYPE_INT);
+        int loop_reg = regalloc_assign(n->name);
+        if (loop_reg >= 0) {
+            emit("mov ");
+            buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+            buf_write_str(out_buf, &out_cursor, ", rax\n");
+        }
+        emit("mov [rbp-");
+        buf_write_int(out_buf, &out_cursor, off);
+        buf_write_str(out_buf, &out_cursor, "], rax\n");
+
+        gen_expr(n->children[1]);                   // limit → r14
+        emitln("mov r14, rax");
+        gen_expr(n->children[2]);                   // step → r15
+        emitln("mov r15, rax");
+
+        emit_jmp("jmp", lbl_check);
+        emit_label(lbl_body);
+
+        // check filter condition — skip body if false
+        gen_expr(n->left);
+        emitln("test rax, rax");
+        int lbl_skip = new_label();
+        emit_jmp("jz", lbl_skip);
+        gen_stmt(n->children[3]);                   // body
+        emit_label(lbl_skip);
+
+        // increment
+        if (loop_reg >= 0) {
+            emit("add ");
+            buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+            buf_write_str(out_buf, &out_cursor, ", r15\n");
+            emit("mov rax, ");
+            buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
+            buf_write_str(out_buf, &out_cursor, "\n");
+            emit("mov [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+        } else {
+            emit("mov rax, [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "]\n");
+            emitln("add rax, r15");
+            emit("mov [rbp-");
+            buf_write_int(out_buf, &out_cursor, off);
+            buf_write_str(out_buf, &out_cursor, "], rax\n");
+        }
+
+        emit_label(lbl_check);
+        emit("mov rax, [rbp-");
+        buf_write_int(out_buf, &out_cursor, off);
+        buf_write_str(out_buf, &out_cursor, "]\n");
+        emitln("cmp rax, r14");
+        emit_jmp("jle", lbl_body);
+        regalloc_free(n->name);
+        break;
+    }
+
     default:
         fprintf(stderr, "Codegen error: unknown statement node\n");
         exit(1);
@@ -715,11 +1284,14 @@ void generate(Node *root, const char *out_file) {
     var_count   = 0;
     stack_top   = 0;
     param_count = 0;
+    cse_clear();
+    regalloc_clear();
 
     // .data section — format strings
     emit_str("section .data\n");
     emit_str("    fmt      db \"%ld\", 10, 0\n");   // int format
     emit_str("    fmtf     db \"%g\",  10, 0\n");   // float format
+    emit_str("    fmts     db \"%s\",  10, 0\n");   // string format
     emit_str("    str_true  db \"true\",  10, 0\n"); // bool true
     emit_str("    str_false db \"false\", 10, 0\n"); // bool false
     emit_str("\n");
