@@ -1,6 +1,6 @@
 # for with condition — print even numbers
 print("even numbers:")
-for i = 0 to 10 if i - (i / 2) * 2 == 0
+for i = 0 to 10 where i - (i / 2) * 2 == 0
     print(i)
 end
 
@@ -11,3 +11,4 @@ do
     print(x)
     x = x + 1
 while x < 5
+

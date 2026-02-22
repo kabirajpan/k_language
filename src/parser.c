@@ -272,6 +272,15 @@ static Node *parse_statement() {
         return n;
     }
 
+    if (t->type == TOK_BREAK) {
+        advance();
+        return new_node(NODE_BREAK);
+    }
+    if (t->type == TOK_CONTINUE) {
+        advance();
+        return new_node(NODE_CONTINUE);
+    }
+
     // do ... while condition
     if (t->type == TOK_DO) {
         advance();
@@ -474,7 +483,7 @@ static Node *parse_statement() {
         }
         n->child_count = 3;
         // optional if condition: for i = 0 to 100 if i % 2 == 0
-        if (peek()->type == TOK_IF) {
+        if (peek()->type == TOK_WHERE) {
             advance();
             Node *fi = new_node(NODE_FOR_IF);
             fi->children[0] = n->children[0];
@@ -619,7 +628,15 @@ static Node *parse_comparison() {
         strncpy(n->op, t->value, 2);
         n->left  = left;
         n->right = parse_expression();
-        return n;
+        left = n;
+    }
+    // logical and / or
+    while (peek()->type == TOK_AND || peek()->type == TOK_OR) {
+        Token *op = advance();
+        Node *n = new_node(op->type == TOK_AND ? NODE_AND : NODE_OR);
+        n->left  = left;
+        n->right = parse_comparison();
+        left = n;
     }
     return left;
 }
@@ -720,6 +737,34 @@ static Node *parse_factor() {
         n->left = parse_expression();   // size
         expect(TOK_RPAREN, ")");
         n->dtype = DTYPE_PTR;
+        return n;
+    }
+
+    // negative number literal: -5
+    if (t->type == TOK_MINUS) {
+        advance();
+        Token *num = peek();
+        if (num->type == TOK_NUMBER) {
+            advance();
+            Node *n  = new_node(NODE_NUMBER);
+            n->ival  = -atoi(num->value);
+            n->dtype = DTYPE_INT;
+            return n;
+        }
+        // negative expression: -(expr)
+        Node *n   = new_node(NODE_NEG);
+        n->right  = parse_factor();
+        n->dtype  = DTYPE_INT;
+        return n;
+    }
+
+    if (t->type == TOK_STRLEN) {
+        advance();
+        expect(TOK_LPAREN, "(");
+        Node *n  = new_node(NODE_STRLEN);
+        n->right = parse_expression();
+        expect(TOK_RPAREN, ")");
+        n->dtype = DTYPE_INT;
         return n;
     }
 

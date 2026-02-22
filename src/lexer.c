@@ -50,6 +50,12 @@ static int is_keyword(const char *s, TokenType *out) {
     if (strcmp(s, "write")    == 0) { *out = TOK_WRITE;    return 1; }
     if (strcmp(s, "close")    == 0) { *out = TOK_CLOSE;    return 1; }
     if (strcmp(s, "do")       == 0) { *out = TOK_DO;       return 1; }
+    if (strcmp(s, "break")    == 0) { *out = TOK_BREAK;    return 1; }
+    if (strcmp(s, "continue") == 0) { *out = TOK_CONTINUE; return 1; }
+    if (strcmp(s, "and")      == 0) { *out = TOK_AND;      return 1; }
+    if (strcmp(s, "or")       == 0) { *out = TOK_OR;       return 1; }
+    if (strcmp(s, "strlen")   == 0) { *out = TOK_STRLEN;   return 1; }
+    if (strcmp(s, "where") == 0) { *out = TOK_WHERE; return 1; }
     return 0;
 }
 

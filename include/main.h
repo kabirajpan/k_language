@@ -72,7 +72,14 @@ typedef enum {
     TOK_TSTR,
     TOK_TPTR,
     TOK_TBOOL,
-    TOK_EOF
+    TOK_EOF,
+
+    TOK_BREAK,
+    TOK_CONTINUE,
+    TOK_AND,
+    TOK_OR,
+    TOK_STRLEN,
+    TOK_WHERE
 } TokenType;
 
 typedef struct {
@@ -165,7 +172,15 @@ typedef enum {
     NODE_CLOSE,
 
     NODE_FOR_IF,  // for i = 0 to 100 if condition
-    NODE_DO_WHILE // do ... while condition
+    NODE_DO_WHILE, // do ... while condition
+  
+    NODE_BREAK,
+    NODE_CONTINUE,
+    NODE_AND,
+    NODE_OR,
+    NODE_NEG,
+    NODE_STRLEN
+                  
 } NodeType;
 
 typedef struct Node Node;

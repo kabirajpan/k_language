@@ -264,6 +264,23 @@ static void regalloc_free(const char *name) {
     }
 }
 
+// break/continue label stack
+#define MAX_LOOP_DEPTH 32
+static int break_stack[MAX_LOOP_DEPTH];
+static int continue_stack[MAX_LOOP_DEPTH];
+static int loop_depth = 0;
+
+static void loop_push(int brk, int cont) {
+    break_stack[loop_depth]    = brk;
+    continue_stack[loop_depth] = cont;
+    loop_depth++;
+}
+static void loop_pop() { loop_depth--; }
+static int  loop_break()    { return break_stack[loop_depth - 1]; }
+static int  loop_continue() { return continue_stack[loop_depth - 1]; }
+
+
+
 // forward declaration
 static int node_uses_var(Node *n, const char *varname);
 
@@ -539,6 +556,53 @@ static void gen_expr(Node *n) {
         break;
     }
 
+    case NODE_AND: {
+        // short circuit: if left is 0, result is 0
+        int lbl_false = new_label();
+        int lbl_done  = new_label();
+        gen_expr(n->left);
+        emitln("test rax, rax");
+        emit_jmp("jz", lbl_false);
+        gen_expr(n->right);
+        emitln("test rax, rax");
+        emit_jmp("jz", lbl_false);
+        emitln("mov rax, 1");
+        emit_jmp("jmp", lbl_done);
+        emit_label(lbl_false);
+        emitln("mov rax, 0");
+        emit_label(lbl_done);
+        break;
+    }
+
+    case NODE_OR: {
+        // short circuit: if left is 1, result is 1
+        int lbl_true = new_label();
+        int lbl_done = new_label();
+        gen_expr(n->left);
+        emitln("test rax, rax");
+        emit_jmp("jnz", lbl_true);
+        gen_expr(n->right);
+        emitln("test rax, rax");
+        emit_jmp("jnz", lbl_true);
+        emitln("mov rax, 0");
+        emit_jmp("jmp", lbl_done);
+        emit_label(lbl_true);
+        emitln("mov rax, 1");
+        emit_label(lbl_done);
+        break;
+    }
+
+    case NODE_NEG:
+        gen_expr(n->right);
+        emitln("neg rax");
+        break;
+
+    case NODE_STRLEN:
+        gen_expr(n->right);             // string address → rax
+        emitln("mov rdi, rax");
+        emitln("call strlen");          // strlen(str) → rax
+        break;
+
     default:
         fprintf(stderr, "Codegen error: unexpected node in expression\n");
         exit(1);
@@ -811,6 +875,7 @@ static void gen_stmt(Node *n) {
     case NODE_WHILE: {
         int lbl_start = new_label();
         int lbl_end   = new_label();
+        loop_push(lbl_end, lbl_start);
         emit_label(lbl_start);
         gen_expr(n->left);
         emitln("test rax, rax");
@@ -818,6 +883,7 @@ static void gen_stmt(Node *n) {
         gen_stmt(n->right);
         emit_jmp("jmp", lbl_start);
         emit_label(lbl_end);
+        loop_pop();
         break;
     }
 
@@ -851,7 +917,11 @@ static void gen_stmt(Node *n) {
         gen_expr(n->children[2]);                   // hoist step → r15
         emitln("mov r15, rax");
 
-        // loop tiling — detect if we should tile this loop
+        int lbl_for_end = new_label();
+        int lbl_increment = new_label();
+        loop_push(lbl_for_end, lbl_increment);
+
+        // loop tilingtect if we should tile this loop
         int tile_size = 64;
         int should_tile = 0;
         int loop_range = get_loop_range(n->children[1], n->children[0]);
@@ -962,6 +1032,7 @@ static void gen_stmt(Node *n) {
                 gen_stmt(body);
             }
 
+            emit_label(lbl_increment);
             if (loop_reg >= 0) {
                 emit("add ");
                 buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
@@ -991,6 +1062,8 @@ static void gen_stmt(Node *n) {
         }  // end else (non-tiled)
 
         regalloc_free(n->name);
+        emit_label(lbl_for_end);
+        loop_pop();
         break;
     }
           
@@ -1001,7 +1074,7 @@ static void gen_stmt(Node *n) {
         int saved_var_count = var_count;
         int saved_stack_top = stack_top;
         memcpy(saved_vars, var_table, sizeof(Var) * var_count);
-        var_count = 0; stack_top = 0; param_count = 0; cse_clear(); regalloc_clear();
+        var_count = 0; stack_top = 0; param_count = 0; cse_clear(); regalloc_clear(); loop_depth = 0;
 
         const char *arg_regs[] = {"rdi", "rsi", "rdx", "rcx", "r8", "r9"};
 
@@ -1192,14 +1265,17 @@ static void gen_stmt(Node *n) {
         break;
     }
 
-    // do ... while condition
     case NODE_DO_WHILE: {
         int lbl_start = new_label();
+        int lbl_end   = new_label();
+        loop_push(lbl_end, lbl_start);
         emit_label(lbl_start);
-        gen_stmt(n->right);             // body always runs first
-        gen_expr(n->left);              // condition
+        gen_stmt(n->right);
+        gen_expr(n->left);
         emitln("test rax, rax");
-        emit_jmp("jnz", lbl_start);    // loop if true
+        emit_jmp("jnz", lbl_start);
+        emit_label(lbl_end);
+        loop_pop();
         break;
     }
 
@@ -1207,6 +1283,7 @@ static void gen_stmt(Node *n) {
     case NODE_FOR_IF: {
         int lbl_body  = new_label();
         int lbl_check = new_label();
+        int lbl_increment = new_label();
 
         gen_expr(n->children[0]);                   // start
         int off = add_var(n->name, DTYPE_INT);
@@ -1226,6 +1303,8 @@ static void gen_stmt(Node *n) {
         emitln("mov r15, rax");
 
         emit_jmp("jmp", lbl_check);
+        int lbl_for_if_end = new_label();
+        loop_push(lbl_for_if_end, lbl_increment);
         emit_label(lbl_body);
 
         // check filter condition — skip body if false
@@ -1236,7 +1315,8 @@ static void gen_stmt(Node *n) {
         gen_stmt(n->children[3]);                   // body
         emit_label(lbl_skip);
 
-        // increment
+        // increment 
+        emit_label(lbl_increment);
         if (loop_reg >= 0) {
             emit("add ");
             buf_write_str(out_buf, &out_cursor, alloc_regs[loop_reg]);
@@ -1263,9 +1343,19 @@ static void gen_stmt(Node *n) {
         buf_write_str(out_buf, &out_cursor, "]\n");
         emitln("cmp rax, r14");
         emit_jmp("jle", lbl_body);
+        emit_label(lbl_for_if_end);
+        loop_pop();
         regalloc_free(n->name);
         break;
     }
+
+    case NODE_BREAK:
+        emit_jmp("jmp", loop_break());
+        break;
+
+    case NODE_CONTINUE:
+        emit_jmp("jmp", loop_continue());
+        break; 
 
     default:
         fprintf(stderr, "Codegen error: unknown statement node\n");
@@ -1287,6 +1377,8 @@ void generate(Node *root, const char *out_file) {
     cse_clear();
     regalloc_clear();
 
+    loop_depth = 0;
+
     // .data section — format strings
     emit_str("section .data\n");
     emit_str("    fmt      db \"%ld\", 10, 0\n");   // int format
@@ -1299,6 +1391,7 @@ void generate(Node *root, const char *out_file) {
     // .text section
     emit_str("section .text\n");
     emit_str("    extern printf\n");
+    emit_str("    extern strlen\n");
     emit_str("    global main\n\n");
 
     // emit all function definitions first
